@@ -12,10 +12,17 @@ Flutter app  ──HTTPS──▶  Next.js route handlers ──┐
      └────────WebSocket──▶  Socket.IO handlers  ──┘
 ```
 
-Both transports run on **one origin and one port**: `server.ts` boots Next.js
-as a request handler inside a Node HTTP server and attaches Socket.IO to it.
-That is also why they share one in-memory game registry — see
+In development both transports run on **one origin and one port**: `server.ts`
+boots Next.js as a request handler inside a Node HTTP server and attaches
+Socket.IO to it. That is also why they share one in-memory game registry — see
 [Architecture](#architecture).
+
+In production they are **two deployments from this one repository**, because
+Socket.IO cannot run on a serverless host — it has no persistent process to
+hold a websocket open, and nothing there executes `server.ts`. The REST API
+stays serverless; `socket-server.ts` runs the realtime half on a host that
+keeps a process alive. See [Production](#production) for why that split is
+safe and how to deploy it.
 
 ---
 
@@ -53,7 +60,8 @@ Verify:
 
 ```bash
 curl http://localhost:3000/api/health
-# {"success":true,"status":"healthy","database":"connected","socket":"attached",...}
+# {"success":true,"status":"healthy","database":"connected",
+#  "socket":{"mode":"attached","status":"up","rooms":0,"players":0},...}
 ```
 
 Then point the app at it:
@@ -78,9 +86,12 @@ with `HOST=0.0.0.0` in the backend's `.env.local`.
 
 | Command | What it does |
 |---|---|
-| `npm run dev` | Development server with reload |
-| `npm run build` | Compiles Next and the custom server to `dist/` |
-| `npm start` | Runs the compiled server |
+| `npm run dev` | Development server with reload — REST **and** Socket.IO on one port |
+| `npm run dev:socket` | Realtime server only, with reload |
+| `npm run build` | Compiles Next and both server entry points to `dist/` |
+| `npm run build:socket` | Compiles the realtime server only (skips `next build`) |
+| `npm start` | Runs the compiled combined server |
+| `npm run start:socket` | Runs the compiled **realtime** server (`socket-server.ts`) |
 | `npm run seed` | Seeds `words`. Idempotent — safe to re-run |
 | `npm run seed -- --language=en --reset` | Reseeds one language from scratch |
 | `npm run sync-indexes` | Rebuilds indexes after a schema change |
@@ -100,7 +111,7 @@ with `HOST=0.0.0.0` in the backend's `.env.local`.
 | `PORT` | no | `3000` | |
 | `HOST` | no | `0.0.0.0` | |
 | `NEXT_PUBLIC_API_URL` | no | `http://localhost:3000` | Advertised to clients |
-| `SOCKET_URL` | no | `http://localhost:3000` | |
+| `SOCKET_URL` | no | `http://localhost:3000` | The realtime origin. Advertised to clients, and probed by `/api/health` when the two halves are deployed separately |
 | `CORS_ORIGIN` | no | `*` | Comma-separated, or `*`. Only gates browsers — native clients send no `Origin` |
 | `LOG_LEVEL` | no | `info` | `error` \| `warn` \| `info` \| `debug` |
 
@@ -282,12 +293,40 @@ rank as `self`.
 ### `GET /api/health`
 
 Unauthenticated, so a load balancer probe works. Returns **503** when the
-database is unreachable, so an orchestrator actually drains the instance.
+database is unreachable, so an orchestrator actually drains the instance. A
+realtime outage does *not* return 503 — guest sign-in still works without it —
+but it does degrade `status`.
+
+Running as one process (`npm run dev`, `npm start`), the socket is checked
+in-process:
 
 ```jsonc
 { "success": true, "status": "healthy", "database": "connected",
-  "socket": "attached", "rooms": 3, "players": 11, "uptimeSeconds": 8412 }
+  "socket": { "mode": "attached", "status": "up", "rooms": 3, "players": 11 },
+  "uptimeSeconds": 8412 }
 ```
+
+Deployed split, this route **asks** the realtime server rather than guessing,
+and reports whatever it actually said:
+
+```jsonc
+{ "success": true, "status": "healthy", "database": "connected",
+  "socket": { "mode": "external", "status": "up",
+              "url": "https://scribble-and-guess-realtime.onrender.com",
+              "rooms": 3, "players": 11, "checkedAt": "2026-01-01T00:00:00.000Z" } }
+```
+
+When the realtime server is unreachable it says so, with the reason — it never
+reports `up` on the strength of `SOCKET_URL` merely being set:
+
+```jsonc
+{ "success": true, "status": "degraded", "database": "connected",
+  "socket": { "mode": "external", "status": "down",
+              "url": "https://...", "reason": "fetch failed" } }
+```
+
+The realtime server answers `GET /healthz` with the same information about
+itself, and that is what a platform health check should point at.
 
 ### Error codes
 
@@ -502,6 +541,11 @@ won, who hosts, permissions, or round status. Concretely:
 ```bash
 npm test          # 85 unit tests, no database required
 npm run test:e2e  # 46 checks, three real clients, needs a running server
+
+# 26 checks against a *split* deployment: REST on one origin, realtime on
+# another. Defaults to the Vercel API plus a local realtime server.
+node tests/realtime.twoclient.mjs
+REST_URL=https://scribble-and-guess-web.vercel.app   SOCK_URL=https://your-realtime-host node tests/realtime.twoclient.mjs
 ```
 
 Unit tests cover scoring properties (speed beats order, difficulty scales,
@@ -517,19 +561,90 @@ players do not** → drawing relays → non-drawer refused → guessing → scor
 duplicate guess refused → timer ends → answer revealed → next drawer → final
 result → play again.
 
+`tests/realtime.twoclient.mjs` is the same idea aimed at the split deployment:
+it mints its JWTs from the REST origin and presents them to a *different*
+realtime origin, which is what proves the two halves share a signing key. It
+covers connect, a refused bad token, hello and clock sync, create and join,
+presence in both directions, ready, start, drawer secrecy, word selection,
+stroke relay, guess validation, the anti-leak rule on chat, automatic
+reconnect with seat restore, and leave.
+
 ---
 
 ## Production
 
+### Socket.IO cannot run on a serverless host
+
+This is worth stating plainly, because getting it wrong produces a backend
+that looks healthy and cannot play a game.
+
+A serverless platform — Vercel, Netlify Functions, Lambda behind API Gateway —
+starts a function to answer a request and tears it down afterwards. It never
+holds a websocket open, and nothing on it executes `server.ts`, which is the
+only thing that calls `attachSocketServer`. Deployed that way, `/api/health`
+reports `socket: detached` and `/socket.io/` returns a 404 page, because there
+is no Socket.IO server in the process at all. No amount of configuration fixes
+that; the runtime cannot do it.
+
+So production runs **two deployments from this one repository**:
+
 ```
 Flutter (Android/iOS)
-   ├── HTTPS ──┐
-   └── WSS ────┤
-               ▼
-        Node backend (this)
-               ▼
-            MongoDB
+   │
+   ├── HTTPS ──▶  REST API          `src/app/api`, serverless (Vercel)
+   │                 │              auth, session, profile, leaderboard
+   │                 ▼
+   │              MongoDB
+   │                 ▲
+   │                 │
+   └── WSS ────▶  Realtime server   `socket-server.ts`, a persistent Node process
+                     │              rooms, game, drawing, guessing, chat, timers
+                     ▼
+                  MongoDB
 ```
+
+Both read the same `MONGODB_URI` and sign with the same `JWT_SECRET`, so the
+token `/api/auth/guest` mints on the REST side authenticates the socket
+handshake on the realtime side.
+
+#### Why splitting them is safe
+
+Live rooms are a process-local `Map` (see *Live state is in memory*), so REST
+and realtime must not both mutate it from separate processes. They do not: the
+Flutter client uses REST only for guest sign-in, the session and the profile —
+all stateless and Mongo-backed — and does every stateful thing over the socket.
+The registry therefore lives entirely in the realtime process, which is the
+single-owner arrangement it was designed for.
+
+The REST room endpoints (`POST /api/rooms`, `/api/rooms/join`, …) still work,
+but they touch the REST deployment's own registry. They are useful against a
+single-process backend and for testing; the app does not use them.
+
+### Deploying the REST half (Vercel)
+
+Nothing special — it is a stock Next.js app. Set these in the project's
+environment: `MONGODB_URI`, `MONGODB_DB`, `JWT_SECRET`, `JWT_EXPIRES_IN`,
+`CORS_ORIGIN`, `LOG_LEVEL`, and `SOCKET_URL` pointing at the realtime
+deployment so `/api/health` can report the realtime state truthfully.
+
+### Deploying the realtime half
+
+Any host that keeps a process alive. `render.yaml` is ready to use as a
+Blueprint; the `Dockerfile` covers Railway, Fly.io, or a plain VM.
+
+```bash
+npm ci
+npm run build:socket          # tsc + tsc-alias; no `next build` needed
+npm run start:socket          # node dist/socket-server.js
+```
+
+Set `HOST=0.0.0.0` (or a container health check cannot reach it), let the
+platform inject `PORT`, and point the health check at `/healthz`.
+
+### Running both in one process
+
+Still supported, and what `npm run dev` does. Any host with a persistent
+process can serve the whole backend from one address:
 
 ```bash
 npm run build
@@ -567,9 +682,17 @@ a *room*.
 
 ### Checklist
 
-- [ ] `JWT_SECRET` is long and random, and not in git
+- [ ] `JWT_SECRET` is long and random, not in git, and **byte-identical on both
+      deployments** — a mismatch rejects every socket handshake with `AUTH_ERROR`
+- [ ] Both deployments point at the same `MONGODB_URI` / `MONGODB_DB`
+- [ ] `SOCKET_URL` on the REST deployment names the realtime host
+- [ ] The Flutter build is given the realtime host too:
+      `--dart-define=SOCKET_URL=https://…`, or `AppConfig.deployedRealtimeUrl`
 - [ ] `CORS_ORIGIN` is a real list, not `*`, if browsers will connect
 - [ ] `npm run seed` has been run against the production database
 - [ ] `npm run sync-indexes` after any schema change
-- [ ] `/api/health` is wired to the load balancer (it returns 503 when down)
+- [ ] `/api/health` is wired to the load balancer (it returns 503 when the
+      database is down), and the realtime host's check points at `/healthz`
+- [ ] `/api/health` reports `socket.status: "up"` — not `detached`, not
+      `down` — before calling the deployment finished
 - [ ] `LOG_LEVEL=info`; logs shipped somewhere

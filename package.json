@@ -8,14 +8,17 @@
   },
   "scripts": {
     "dev": "cross-env NODE_ENV=development tsx watch server.ts",
-    "build": "next build && tsc --project tsconfig.server.json",
+    "build": "next build && tsc --project tsconfig.server.json && tsc-alias --project tsconfig.server.json",
     "start": "cross-env NODE_ENV=production node dist/server.js",
     "seed": "tsx scripts/seedWords.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "sync-indexes": "tsx scripts/syncIndexes.ts",
-    "test:e2e": "tsx tests/e2e.game.ts"
+    "test:e2e": "tsx tests/e2e.game.ts",
+    "dev:socket": "cross-env NODE_ENV=development tsx watch socket-server.ts",
+    "build:socket": "tsc --project tsconfig.server.json && tsc-alias --project tsconfig.server.json",
+    "start:socket": "cross-env NODE_ENV=production node dist/socket-server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -35,6 +38,7 @@
     "@types/node": "^22.10.7",
     "@types/react": "^19.0.7",
     "socket.io-client": "^4.8.1",
+    "tsc-alias": "^1.9.4",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^2.1.8"

@@ -1,0 +1,66 @@
+# Deployment for the realtime half of the backend.
+#
+# The REST API stays on Vercel, which is a good host for it: the route
+# handlers in `src/app/api` are stateless and Mongo-backed, so serving them as
+# serverless functions costs nothing and scales for free.
+#
+# Socket.IO cannot live there. A serverless function is started per request
+# and torn down after it; it never holds a websocket open, and nothing on
+# Vercel executes `server.ts`, which is the only thing that calls
+# `attachSocketServer`. That is why `/api/health` reported `socket: detached`.
+#
+# This service runs `socket-server.ts` — the same handlers, without Next — on
+# a host that keeps the process alive.
+#
+# Deploy: push this repo, then in the Render dashboard "New > Blueprint" and
+# point it at this file. Set the four secret values marked `sync: false`.
+services:
+  - type: web
+    name: scribble-and-guess-realtime
+    runtime: node
+    plan: starter
+    region: oregon
+    # `rootDir` matters if the repo root is the folder holding both projects.
+    # Delete it when this directory is itself the repository root.
+    rootDir: scribbleAndGuessWeb
+    buildCommand: npm ci && npm run build:socket
+    startCommand: npm run start:socket
+
+    # Socket.IO answers this, and the REST deployment's /api/health probes it
+    # to report the realtime state rather than guessing at it.
+    healthCheckPath: /healthz
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+
+      # Render injects PORT; `env.ts` reads it. Do not pin it here.
+
+      # Must be byte-identical to the REST deployment's value: a token minted
+      # by /api/auth/guest on Vercel is verified here, and a different secret
+      # would reject every handshake with AUTH_ERROR.
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRES_IN
+        value: 30d
+
+      # The same cluster the REST API writes to.
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        sync: false
+
+      # Browser origins allowed to open a socket. Native Flutter clients send
+      # no Origin header and are unaffected by this either way.
+      - key: CORS_ORIGIN
+        sync: false
+
+      - key: LOG_LEVEL
+        value: info
+
+    # A drawing game is stateful in memory: the live room registry belongs to
+    # this process. Scaling past one instance needs the Redis adapter (see the
+    # scaling note in `src/config/socket.ts`) before it is safe.
+    numInstances: 1

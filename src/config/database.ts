@@ -31,9 +31,46 @@ const cache: ConnectionCache = (globalCache.__scribbleMongoose ??= {
 // silently dropping them. A typo'd field name should be a loud failure.
 mongoose.set('strictQuery', true);
 
-/** Opens the connection, or returns the one already open. */
+/** Mongoose's `readyState` values, named so the checks below read plainly. */
+const DISCONNECTED = 0;
+const CONNECTED = 1;
+const CONNECTING = 2;
+
+/**
+ * Opens the connection, or returns the one already open.
+ *
+ * ## Why the cached instance is re-checked against the driver
+ *
+ * On a serverless host the process is frozen between invocations rather than
+ * torn down, and the TCP socket to Mongo does not survive a long enough sleep.
+ * The cached `connection` object is still sitting there when the process
+ * thaws, but it is not usable. Returning it on the strength of it being
+ * non-null is what made the deployed `/api/health` answer
+ * `database: disconnected` on the first request after an idle period, in a few
+ * hundred milliseconds — far too fast to have attempted a connection at all.
+ *
+ * It is worse than a slow health check: `bufferCommands` is off, so a query
+ * issued against a dead connection throws immediately instead of waiting for
+ * the driver to reconnect. The first player to open the app after a quiet spell
+ * would have their guest sign-in fail outright.
+ *
+ * So the driver's own `readyState` decides, and a cache that no longer matches
+ * it is dropped and rebuilt.
+ */
 export async function connectToDatabase(): Promise<typeof mongoose> {
-  if (cache.connection) return cache.connection;
+  if (cache.connection && mongoose.connection.readyState === CONNECTED) {
+    return cache.connection;
+  }
+
+  // Anything other than "still connecting" means the cached instance is stale.
+  // Clearing it is what forces a genuine reconnect below.
+  if (cache.connection && mongoose.connection.readyState !== CONNECTING) {
+    logger.warn('mongo connection went stale; reconnecting', {
+      readyState: mongoose.connection.readyState,
+    });
+    cache.connection = null;
+    cache.promise = null;
+  }
 
   if (!cache.promise) {
     cache.promise = mongoose
@@ -71,16 +108,17 @@ export async function connectToDatabase(): Promise<typeof mongoose> {
 
 /** Whether the driver currently reports a usable connection. */
 export function isDatabaseConnected(): boolean {
-  return mongoose.connection.readyState === 1;
+  return mongoose.connection.readyState === CONNECTED;
 }
 
 /** A one-word health summary for `GET /api/health`. */
 export function databaseStatus(): 'connected' | 'connecting' | 'disconnected' {
   switch (mongoose.connection.readyState) {
-    case 1:
+    case CONNECTED:
       return 'connected';
-    case 2:
+    case CONNECTING:
       return 'connecting';
+    case DISCONNECTED:
     default:
       return 'disconnected';
   }

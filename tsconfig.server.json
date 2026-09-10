@@ -8,6 +8,6 @@
     "jsx": "react-jsx",
     "incremental": false
   },
-  "include": ["server.ts", "src/**/*.ts"],
+  "include": ["server.ts", "socket-server.ts", "src/**/*.ts"],
   "exclude": ["node_modules", "dist", "tests", "scripts", "src/app/**"]
 }
