@@ -1,0 +1,132 @@
+import { emitToRoomExcept } from '@/config/socket';
+import {
+  CLIENT_DRAW_APPEND,
+  CLIENT_DRAW_BEGIN,
+  CLIENT_DRAW_CLEAR,
+  CLIENT_DRAW_END,
+  CLIENT_DRAW_REDO,
+  CLIENT_DRAW_UNDO,
+  SERVER_DRAW_APPEND,
+  SERVER_DRAW_BEGIN,
+  SERVER_DRAW_CLEAR,
+  SERVER_DRAW_END,
+  SERVER_DRAW_REDO,
+  SERVER_DRAW_UNDO,
+} from '@/constants/socket.constants';
+import { drawingService } from '@/services/drawing.service';
+import { on } from '@/socket/handler';
+import type { GameSocket } from '@/types/socket.types';
+
+/**
+ * The drawing relay (brief sections 24 to 26).
+ *
+ * ## The hot path
+ *
+ * `c:draw:append` runs roughly seventeen times a second per drawer. Everything
+ * about these handlers is shaped by that: no acks, no database, no awaits, and
+ * the permission check is a pair of string comparisons against state already
+ * in memory.
+ *
+ * ## Why broadcasts exclude the sender
+ *
+ * The drawer already painted the stroke locally the moment their finger moved
+ * — that is what makes drawing feel instant. Echoing it back would make them
+ * render it twice and, worse, would tie their own line's smoothness to their
+ * network latency.
+ */
+export function registerDrawingHandlers(socket: GameSocket): void {
+  const roomId = (): string => socket.data.roomId ?? '';
+
+  on(
+    socket,
+    CLIENT_DRAW_BEGIN,
+    ({ room, userId, socket: sock }, payload) => {
+      drawingService.assertCanDraw(room, userId);
+
+      const body = (payload ?? {}) as { stroke?: unknown };
+      const stroke = drawingService.sanitizeStroke(body.stroke ?? payload, userId);
+
+      if (!drawingService.begin(room, stroke)) return;
+
+      emitToRoomExcept(sock, roomId(), SERVER_DRAW_BEGIN, { stroke });
+    },
+    { limit: 'drawing', requiresRoom: true },
+  );
+
+  on(
+    socket,
+    CLIENT_DRAW_APPEND,
+    ({ room, userId, socket: sock }, payload) => {
+      drawingService.assertCanDraw(room, userId);
+
+      const body = (payload ?? {}) as { strokeId?: unknown; points?: unknown };
+      const strokeId = typeof body.strokeId === 'string' ? body.strokeId : '';
+      if (!strokeId) return;
+
+      const points = drawingService.sanitizePoints(body.points);
+      if (points.length === 0) return;
+
+      // A batch for a stroke the server never saw begin is dropped rather than
+      // relayed: the receivers would have nothing to attach it to either.
+      if (!drawingService.append(room, strokeId, points)) return;
+
+      emitToRoomExcept(sock, roomId(), SERVER_DRAW_APPEND, { strokeId, points });
+    },
+    { limit: 'drawing', requiresRoom: true },
+  );
+
+  on(
+    socket,
+    CLIENT_DRAW_END,
+    ({ room, userId, socket: sock }, payload) => {
+      drawingService.assertCanDraw(room, userId);
+
+      const body = (payload ?? {}) as { strokeId?: unknown };
+      const strokeId = typeof body.strokeId === 'string' ? body.strokeId : '';
+      if (!strokeId) return;
+
+      emitToRoomExcept(sock, roomId(), SERVER_DRAW_END, { strokeId });
+    },
+    { limit: 'drawing', requiresRoom: true },
+  );
+
+  on(
+    socket,
+    CLIENT_DRAW_UNDO,
+    ({ room, userId, socket: sock }) => {
+      drawingService.assertCanDraw(room, userId);
+
+      const stroke = drawingService.undo(room, userId);
+      if (!stroke) return;
+
+      emitToRoomExcept(sock, roomId(), SERVER_DRAW_UNDO, { strokeId: stroke.id });
+    },
+    { limit: 'drawing', requiresRoom: true },
+  );
+
+  on(
+    socket,
+    CLIENT_DRAW_REDO,
+    ({ room, userId, socket: sock }) => {
+      drawingService.assertCanDraw(room, userId);
+
+      const stroke = drawingService.redo(room);
+      if (!stroke) return;
+
+      emitToRoomExcept(sock, roomId(), SERVER_DRAW_REDO, { stroke });
+    },
+    { limit: 'drawing', requiresRoom: true },
+  );
+
+  on(
+    socket,
+    CLIENT_DRAW_CLEAR,
+    ({ room, userId, socket: sock }) => {
+      drawingService.assertCanDraw(room, userId);
+
+      drawingService.clear(room);
+      emitToRoomExcept(sock, roomId(), SERVER_DRAW_CLEAR, {});
+    },
+    { limit: 'drawing', requiresRoom: true },
+  );
+}

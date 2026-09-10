@@ -1,0 +1,42 @@
+{
+  "name": "scribble-and-guess-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Authoritative REST + Socket.IO backend for Scribble & Guess. No game UI, no admin panel.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "cross-env NODE_ENV=development tsx watch server.ts",
+    "build": "next build && tsc --project tsconfig.server.json",
+    "start": "cross-env NODE_ENV=production node dist/server.js",
+    "seed": "tsx scripts/seedWords.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "sync-indexes": "tsx scripts/syncIndexes.ts",
+    "test:e2e": "tsx tests/e2e.game.ts"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cross-env": "^7.0.3",
+    "dotenv": "^16.4.7",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.9.5",
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "socket.io": "^4.8.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^22.10.7",
+    "@types/react": "^19.0.7",
+    "socket.io-client": "^4.8.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,65 @@
+import type { Server as HttpServer } from 'node:http';
+
+import { createSocketServer } from '@/config/socket';
+import { TIMING } from '@/constants/game.constants';
+import { SERVER_TIME_SYNC } from '@/constants/socket.constants';
+import { presenceService } from '@/services/presence.service';
+import { registerChatHandlers } from '@/socket/chat.socket';
+import { registerDrawingHandlers } from '@/socket/drawing.socket';
+import { registerGameHandlers } from '@/socket/game.socket';
+import { registerPresenceHandlers } from '@/socket/presence.socket';
+import { registerRoomHandlers } from '@/socket/room.socket';
+import { installSocketAuth } from '@/socket/socket.auth';
+import type { GameServer, GameSocket } from '@/types/socket.types';
+import { logger } from '@/utils/logger';
+
+/**
+ * Boots the realtime server (brief sections 14 to 16).
+ *
+ * Attached to the same HTTP server Next.js is serving from, so one port
+ * carries both the REST API and the websocket. That is what keeps deployment
+ * simple and what makes the reverse-proxy story in brief section 68 a matter
+ * of forwarding one origin with upgrade headers rather than two services.
+ */
+
+let started = false;
+
+export function attachSocketServer(httpServer: HttpServer): GameServer {
+  const io = createSocketServer(httpServer);
+
+  // Rejects unauthenticated sockets before any handler can run.
+  installSocketAuth(io);
+
+  io.on('connection', (socket) => {
+    const gameSocket = socket as GameSocket;
+
+    logger.debug('socket connected', { userId: gameSocket.data.user.id });
+
+    registerPresenceHandlers(gameSocket);
+    registerRoomHandlers(gameSocket);
+    registerGameHandlers(gameSocket);
+    registerDrawingHandlers(gameSocket);
+    registerChatHandlers(gameSocket);
+
+    // Seeds the client's clock estimate immediately, so a countdown is
+    // displayable before the first `c:time:ping` round trip completes.
+    gameSocket.emit(SERVER_TIME_SYNC, { serverTimeMs: Date.now() });
+  });
+
+  if (!started) {
+    started = true;
+
+    // A one-way clock broadcast. The client folds it in with a small weight
+    // because it carries no round-trip information; the ping/pong measurement
+    // stays in charge of the offset.
+    const clock = setInterval(() => {
+      io.emit(SERVER_TIME_SYNC, { serverTimeMs: Date.now() });
+    }, TIMING.timeSyncIntervalMs);
+    clock.unref?.();
+
+    presenceService.startSweeper();
+  }
+
+  logger.info('socket.io attached');
+  return io;
+}
