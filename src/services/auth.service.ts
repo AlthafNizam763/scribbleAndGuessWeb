@@ -3,6 +3,7 @@ import jwt, { type SignOptions } from 'jsonwebtoken';
 
 import { env } from '@/config/env';
 import { INPUT_LIMITS } from '@/constants/game.constants';
+import { User } from '@/models/User';
 import { userRepository } from '@/repositories/user.repository';
 import type { AuthProvider, AuthenticatedUser, JwtPayload } from '@/types/auth.types';
 import { errors } from '@/utils/errors';
@@ -138,7 +139,6 @@ export class AuthService {
     }
 
     const passwordHash = await bcrypt.hash(input.password, BCRYPT_ROUNDS);
-    const { User } = await import('@/models/User');
     await User.updateOne(
       { _id: input.userId },
       { $set: { email: input.email.trim().toLowerCase(), passwordHash, authProvider: 'email' } },
@@ -147,7 +147,6 @@ export class AuthService {
 
   /** Verifies an email/password pair. */
   async login(email: string, password: string): Promise<{ token: string; user: AuthenticatedUser }> {
-    const { User } = await import('@/models/User');
     const user = await User.findOne({ email: email.trim().toLowerCase() })
       .select('+passwordHash')
       .lean()
