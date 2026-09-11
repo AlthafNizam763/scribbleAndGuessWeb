@@ -1,66 +1,82 @@
-# Deployment for the realtime half of the backend.
+# Render Web Service: the whole backend in one persistent process.
 #
-# The REST API stays on Vercel, which is a good host for it: the route
-# handlers in `src/app/api` are stateless and Mongo-backed, so serving them as
-# serverless functions costs nothing and scales for free.
+# `npm start` runs `dist/server.js`, which boots Next.js as a request handler
+# inside a Node HTTP server it creates itself, connects Mongo, and attaches
+# Socket.IO to that same server. One port therefore carries both halves: the
+# REST routes under /api and the websocket at /socket.io.
 #
-# Socket.IO cannot live there. A serverless function is started per request
-# and torn down after it; it never holds a websocket open, and nothing on
-# Vercel executes `server.ts`, which is the only thing that calls
-# `attachSocketServer`. That is why `/api/health` reported `socket: detached`.
+# That is the whole reason for deploying here. On Vercel each route in
+# `src/app/api` is an isolated serverless function; nothing executes
+# `server.ts`, so `attachSocketServer` is never called and /api/health can
+# only ever report the socket detached. A function cannot hold a websocket
+# open, so it is not a setting to tweak — the runtime cannot host Socket.IO.
 #
-# This service runs `socket-server.ts` — the same handlers, without Next — on
-# a host that keeps the process alive.
+# The existing Vercel deployment can stay exactly as it is: it shares this
+# MONGODB_URI and JWT_SECRET, so a token minted there authenticates here.
+# Point the Flutter client's SOCKET_URL at this service.
 #
-# Deploy: push this repo, then in the Render dashboard "New > Blueprint" and
-# point it at this file. Set the four secret values marked `sync: false`.
+# Deploy: Render dashboard > New > Blueprint, pointed at this file, then fill
+# in the values marked `sync: false`.
 services:
   - type: web
-    name: scribble-and-guess-realtime
+    name: scribble-and-guess
     runtime: node
     plan: starter
     region: oregon
-    # `rootDir` matters if the repo root is the folder holding both projects.
-    # Delete it when this directory is itself the repository root.
-    rootDir: scribbleAndGuessWeb
-    buildCommand: npm ci && npm run build:socket
-    startCommand: npm run start:socket
 
-    # Socket.IO answers this, and the REST deployment's /api/health probes it
-    # to report the realtime state rather than guessing at it.
-    healthCheckPath: /healthz
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+
+    # Answered by the Next route, which reports the live Socket.IO state.
+    # It returns 503 while Mongo is unreachable, so a broken instance is kept
+    # out of rotation rather than serving sign-ins that cannot work.
+    healthCheckPath: /api/health
 
     envVars:
       - key: NODE_ENV
         value: production
+
+      # Render routes to the container's external interface, so the process
+      # must not bind 127.0.0.1.
       - key: HOST
         value: 0.0.0.0
 
-      # Render injects PORT; `env.ts` reads it. Do not pin it here.
+      # Render injects PORT and `env.ts` reads it. Never pin it here: a
+      # hardcoded port is a service that never passes its health check.
 
-      # Must be byte-identical to the REST deployment's value: a token minted
-      # by /api/auth/guest on Vercel is verified here, and a different secret
-      # would reject every handshake with AUTH_ERROR.
+      # Must be byte-identical to the Vercel deployment's value. A token
+      # minted by /api/auth/guest there is verified here, and a different
+      # secret rejects every handshake with AUTH_ERROR.
       - key: JWT_SECRET
         sync: false
       - key: JWT_EXPIRES_IN
         value: 30d
 
-      # The same cluster the REST API writes to.
+      # The same Atlas cluster the REST deployment writes to.
       - key: MONGODB_URI
         sync: false
       - key: MONGODB_DB
         sync: false
 
-      # Browser origins allowed to open a socket. Native Flutter clients send
-      # no Origin header and are unaffected by this either way.
+      # Browser origins allowed to call the API and open a socket. Native
+      # Flutter clients send no Origin header and are unaffected either way.
       - key: CORS_ORIGIN
+        sync: false
+
+      # This service serves its own socket, so the in-process check answers
+      # and the external probe in /api/health is never reached. Set it anyway
+      # so the value advertised to clients is this origin rather than
+      # localhost.
+      - key: SOCKET_URL
+        sync: false
+      - key: NEXT_PUBLIC_API_URL
         sync: false
 
       - key: LOG_LEVEL
         value: info
 
     # A drawing game is stateful in memory: the live room registry belongs to
-    # this process. Scaling past one instance needs the Redis adapter (see the
-    # scaling note in `src/config/socket.ts`) before it is safe.
+    # this process, and a player's socket must keep reaching the instance that
+    # holds their room. Scaling past one instance needs the Redis adapter (see
+    # the scaling note in `src/config/socket.ts`) before it is safe.
     numInstances: 1

@@ -15,6 +15,30 @@ import { z } from 'zod';
 loadDotenv({ path: '.env.local' });
 loadDotenv();
 
+/**
+ * Whether this module is being evaluated by `next build` rather than by a
+ * running server.
+ *
+ * `next build` imports every route handler to collect page data, so this file
+ * runs on the build machine too — and a build machine has no business holding
+ * the production signing key. Throwing there turns a missing secret into a
+ * failed *build* rather than a failed *boot*, and Next reports it as a
+ * prerender error on `/500` rather than as the configuration problem it is.
+ *
+ * Next sets `NEXT_PHASE` immediately before forking the workers that do that
+ * collection, so the flag is visible exactly where it is needed. Nothing is
+ * relaxed for a real server: `server.ts` boots with this unset and gets the
+ * full strict parse below, so a genuinely misconfigured deployment still
+ * refuses to start rather than minting tokens nobody can verify.
+ */
+const isBuildPhase = process.env.NEXT_PHASE === 'phase-production-build';
+
+/**
+ * Stand-in used only while collecting page data. It never reaches a running
+ * server, and it is deliberately recognisable if it somehow did.
+ */
+const BUILD_PLACEHOLDER_SECRET = 'build-phase-placeholder-not-a-real-secret';
+
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 
@@ -36,7 +60,9 @@ const schema = z.object({
    * placeholder, because a guessable key means anybody can mint a token for
    * any user id.
    */
-  JWT_SECRET: z.string().min(1, 'JWT_SECRET is required'),
+  JWT_SECRET: isBuildPhase
+    ? z.string().min(1).default(BUILD_PLACEHOLDER_SECRET)
+    : z.string().min(1, 'JWT_SECRET is required'),
   JWT_EXPIRES_IN: z.string().default('30d'),
 
   PORT: z.coerce.number().int().positive().default(3000),
@@ -65,7 +91,7 @@ const raw = parsed.data;
 
 const isProduction = raw.NODE_ENV === 'production';
 
-if (isProduction) {
+if (isProduction && !isBuildPhase) {
   if (raw.JWT_SECRET.length < 32 || raw.JWT_SECRET.includes('change-me')) {
     throw new Error(
       'JWT_SECRET is too weak for production. Generate one with:\n' +

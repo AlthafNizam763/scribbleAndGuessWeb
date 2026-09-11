@@ -43,6 +43,9 @@ interface SocketReport {
   mode: 'attached' | 'external' | 'not_configured';
   status: 'up' | 'down' | 'unknown';
   url?: string;
+  /** The handshake path clients must use. Read from the live instance. */
+  path?: string;
+  transports?: readonly string[];
   rooms?: number;
   players?: number;
   reason?: string;
@@ -122,12 +125,28 @@ async function socketReport(): Promise<SocketReport> {
   // Same process as the realtime server (`server.ts`, and local development).
   const inProcess = getSocketServer();
   if (inProcess) {
+    // A non-null instance only proves `createSocketServer` ran at some point.
+    // What a caller actually needs to know is whether a handshake would be
+    // answered, and that is a property of the HTTP server the instance was
+    // attached to: after a shutdown, or if attachment ever happened against a
+    // server that never listened, the instance is still sitting in
+    // `globalThis` while every connection attempt fails. So the listener's own
+    // state decides, and the path and transports are read off the live server
+    // rather than restated from the config — a client that cannot connect can
+    // then compare what it is dialling against what is actually being served.
+    const listening = inProcess.httpServer?.listening === true;
     const rooms = roomService.all();
+
     return {
       mode: 'attached',
-      status: 'up',
+      status: listening ? 'up' : 'down',
+      path: inProcess.path(),
+      transports: inProcess._opts.transports,
       rooms: rooms.length,
       players: rooms.reduce((total, room) => total + room.players.size, 0),
+      ...(listening
+        ? {}
+        : { reason: 'socket.io is attached but its http server is not listening' }),
     };
   }
 

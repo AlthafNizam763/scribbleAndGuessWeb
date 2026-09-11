@@ -5,6 +5,7 @@ import next from 'next';
 
 import { connectToDatabase, disconnectFromDatabase, watchDatabaseEvents } from '@/config/database';
 import { env } from '@/config/env';
+import { getSocketServer } from '@/config/socket';
 import { attachSocketServer } from '@/socket/socket.server';
 import { logger } from '@/utils/logger';
 
@@ -44,10 +45,16 @@ async function main(): Promise<void> {
 
   attachSocketServer(server);
 
+  // `env.host` defaults to 0.0.0.0 and `env.port` comes from PORT, which is
+  // what a platform like Render requires: it injects the port and routes to
+  // the container's external interface, so binding 127.0.0.1 or a hardcoded
+  // 3000 would fail its health check and never receive traffic.
   server.listen(env.port, env.host, () => {
     logger.info('server listening', {
       url: `http://${env.host}:${env.port}`,
       env: env.nodeEnv,
+      socketPath: '/socket.io',
+      corsOrigins: env.corsOrigins,
     });
   });
 
@@ -75,6 +82,13 @@ function installShutdownHandlers(server: ReturnType<typeof createServer>): void 
       process.exit(1);
     }, 10_000);
     forced.unref();
+
+    // Disconnect clients deliberately rather than letting them wait out a ping
+    // timeout: that gets the Flutter client's reconnect path running straight
+    // away instead of leaving a round looking frozen. It also releases the
+    // upgrade listener, without which `server.close()` waits on live sockets
+    // and the platform's shutdown grace period expires into a SIGKILL.
+    getSocketServer()?.close();
 
     server.close(() => {
       void disconnectFromDatabase()
