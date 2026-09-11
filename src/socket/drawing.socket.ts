@@ -1,4 +1,4 @@
-import { emitToRoomExcept } from '@/config/socket';
+import { emitToRoom, emitToRoomExcept } from '@/config/socket';
 import {
   CLIENT_DRAW_APPEND,
   CLIENT_DRAW_BEGIN,
@@ -27,12 +27,20 @@ import type { GameSocket } from '@/types/socket.types';
  * the permission check is a pair of string comparisons against state already
  * in memory.
  *
- * ## Why broadcasts exclude the sender
+ * ## Why stroke broadcasts exclude the sender, and the rest do not
  *
  * The drawer already painted the stroke locally the moment their finger moved
- * — that is what makes drawing feel instant. Echoing it back would make them
- * render it twice and, worse, would tie their own line's smoothness to their
- * network latency.
+ * — that is what makes drawing feel instant. Echoing `begin`, `append` and
+ * `end` back would make them render it twice and, worse, would tie their own
+ * line's smoothness to their network latency. The client mirrors those three
+ * onto its own board instead (see `SocketDrawingRepository`).
+ *
+ * Undo, redo and clear go to the whole room, the sender included. Which stroke
+ * each one moves is decided *here* — `undo` takes the last stroke this user
+ * authored, `redo` pops the board's own stack — so a client that applied them
+ * optimistically would be guessing, and would drift the moment it guessed
+ * wrong. They are also one press each rather than seventeen messages a second,
+ * so the round trip costs nothing worth saving.
  */
 export function registerDrawingHandlers(socket: GameSocket): void {
   const roomId = (): string => socket.data.roomId ?? '';
@@ -93,13 +101,13 @@ export function registerDrawingHandlers(socket: GameSocket): void {
   on(
     socket,
     CLIENT_DRAW_UNDO,
-    ({ room, userId, socket: sock }) => {
+    ({ room, userId }) => {
       drawingService.assertCanDraw(room, userId);
 
       const stroke = drawingService.undo(room, userId);
       if (!stroke) return;
 
-      emitToRoomExcept(sock, roomId(), SERVER_DRAW_UNDO, { strokeId: stroke.id });
+      emitToRoom(roomId(), SERVER_DRAW_UNDO, { strokeId: stroke.id });
     },
     { limit: 'drawing', requiresRoom: true },
   );
@@ -107,13 +115,13 @@ export function registerDrawingHandlers(socket: GameSocket): void {
   on(
     socket,
     CLIENT_DRAW_REDO,
-    ({ room, userId, socket: sock }) => {
+    ({ room, userId }) => {
       drawingService.assertCanDraw(room, userId);
 
       const stroke = drawingService.redo(room);
       if (!stroke) return;
 
-      emitToRoomExcept(sock, roomId(), SERVER_DRAW_REDO, { stroke });
+      emitToRoom(roomId(), SERVER_DRAW_REDO, { stroke });
     },
     { limit: 'drawing', requiresRoom: true },
   );
@@ -121,11 +129,11 @@ export function registerDrawingHandlers(socket: GameSocket): void {
   on(
     socket,
     CLIENT_DRAW_CLEAR,
-    ({ room, userId, socket: sock }) => {
+    ({ room, userId }) => {
       drawingService.assertCanDraw(room, userId);
 
       drawingService.clear(room);
-      emitToRoomExcept(sock, roomId(), SERVER_DRAW_CLEAR, {});
+      emitToRoom(roomId(), SERVER_DRAW_CLEAR, {});
     },
     { limit: 'drawing', requiresRoom: true },
   );

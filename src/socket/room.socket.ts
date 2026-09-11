@@ -58,6 +58,12 @@ async function enterRoom(socket: GameSocket, room: RuntimeRoom): Promise<void> {
 
   presenceService.attach(room, socket.data.user.id, socket.id);
 
+  // This arrival may be the one that puts a paused match back at strength.
+  // Done before the broadcast below so the newcomer's very first state already
+  // says the game is resuming, rather than showing them a waiting screen that
+  // is corrected a moment later.
+  await gameService.resumeIfPossible(room);
+
   await gameService.broadcastState(room);
 
   // The board as it stands, so a late joiner or a returning player sees the

@@ -494,6 +494,10 @@ function statusFor(room: RuntimeRoom) {
   if (room.closed) return ROOM_STATUS.closed;
   switch (room.phase) {
     case GAME_PHASE.lobby:
+    // A paused match is advertised as waiting, because that is what the room
+    // is actually doing and what a prospective joiner needs to know: it has
+    // room, it is open, and arriving is what restarts it.
+    case GAME_PHASE.paused:
       return ROOM_STATUS.waiting;
     case GAME_PHASE.starting:
       return ROOM_STATUS.starting;

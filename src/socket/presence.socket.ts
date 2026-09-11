@@ -162,6 +162,10 @@ async function seat(socket: GameSocket, roomId: string): Promise<void> {
 
   presenceService.attach(room, socket.data.user.id, socket.id);
 
+  // A reconnect counts towards the minimum exactly as a fresh join does, so a
+  // match paused by this player's departure comes back when they do.
+  await gameService.resumeIfPossible(room);
+
   socket.emit(SERVER_DRAW_SNAPSHOT, { strokes: drawingService.snapshot(room) });
   await gameService.broadcastState(room);
 

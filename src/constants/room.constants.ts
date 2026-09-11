@@ -27,6 +27,18 @@ export const GAME_PHASE = {
   drawing: 'drawing',
   roundEnd: 'round_result',
   gameEnd: 'final_result',
+  /**
+   * A started match that cannot legally run right now, because the room has
+   * dropped below `MIN_PLAYERS_TO_START` active players.
+   *
+   * Deliberately a phase rather than a flag beside one. A paused game is
+   * neither in the lobby — the scores, the turn order and the round number are
+   * all still live — nor mid-turn: there is no drawer, no word and no
+   * countdown. Every guard in the engine already keys off the phase, so
+   * expressing it here is what makes "the last player cannot carry on alone"
+   * true by construction rather than only in the UI.
+   */
+  paused: 'paused',
 } as const;
 export type GamePhaseWire = (typeof GAME_PHASE)[keyof typeof GAME_PHASE];
 

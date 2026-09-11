@@ -1,5 +1,5 @@
 import { MIN_PLAYERS_TO_START, TIMING } from '@/constants/game.constants';
-import { GAME_PHASE } from '@/constants/room.constants';
+import { CONNECTION, GAME_PHASE } from '@/constants/room.constants';
 import {
   SERVER_DRAW_CLEAR,
   SERVER_GAME_END,
@@ -27,7 +27,7 @@ import type {
   RoundResultDto,
   WordItemDto,
 } from '@/types/game.types';
-import type { RuntimeRoom, RuntimeRound } from '@/types/socket.types';
+import type { RuntimePlayer, RuntimeRoom, RuntimeRound } from '@/types/socket.types';
 import { errors } from '@/utils/errors';
 import { logger } from '@/utils/logger';
 import { evaluateGuess, normalizeGuess } from '@/utils/normalizeGuess';
@@ -40,15 +40,28 @@ import { shuffled } from '@/utils/random';
  *
  * ```
  *   lobby -> starting -> word_selection -> drawing -> round_result
- *                             ^                            |
- *                             +------- next turn ----------+
- *                                                          |
- *                                                  final_result -> lobby
+ *                  ^          ^                            |
+ *                  |          +------- next turn ----------+
+ *                  |                                       |
+ *                  |                               final_result -> lobby
+ *                  |
+ *               paused  <-- any live phase, the moment the room drops below
+ *                           MIN_PLAYERS_TO_START active players
  * ```
  *
  * Every transition is driven either by a host action or by a timer this
  * process owns. Nothing a client sends can move the game forward except by
  * asking, and every ask is checked (brief section 71).
+ *
+ * ## Why `paused` is here and not in the UI
+ *
+ * A two-player game whose second player walks out has no legal next state: one
+ * person cannot both draw and guess. Leaving the phase on `drawing` and merely
+ * hiding the canvas would keep the engine running — the buzzer would still
+ * fire, the next turn would still be scheduled, and points would still be
+ * awarded for a round nobody could play. So the engine parks the match in
+ * `paused` instead: the round is abandoned, every turn timer is cancelled, and
+ * nothing resumes until `resumeIfPossible` sees the room back at strength.
  *
  * ## The one rule that shapes the whole file
  *
@@ -135,6 +148,166 @@ export class GameService {
     }));
   }
 
+  // ------------------------------------------------- the minimum-player rule
+
+  /**
+   * The players who count towards the minimum.
+   *
+   * A `reconnecting` player still counts. They hold their seat, their score and
+   * their correct-guess status for the whole reconnect grace period (brief
+   * section 38), so treating a tunnel or a locked phone as a departure would
+   * tear down a game that is about to carry on perfectly well. Only a player
+   * the room has actually written off — `disconnected`, set when their grace
+   * period expires and they are removed — stops counting.
+   */
+  private activePlayers(room: RuntimeRoom): RuntimePlayer[] {
+    return [...room.players.values()].filter((p) => p.connection !== CONNECTION.disconnected);
+  }
+
+  /** Whether the room can legally run a turn right now. */
+  hasEnoughPlayers(room: RuntimeRoom): boolean {
+    return this.activePlayers(room).length >= MIN_PLAYERS_TO_START;
+  }
+
+  /** Whether a phase is one the minimum-player rule applies to. */
+  private isLive(phase: RuntimeRoom['phase']): boolean {
+    return (
+      phase === GAME_PHASE.starting ||
+      phase === GAME_PHASE.wordSelection ||
+      phase === GAME_PHASE.drawing ||
+      phase === GAME_PHASE.roundEnd
+    );
+  }
+
+  /**
+   * Parks a running match because the room no longer has enough players.
+   *
+   * The turn in progress is *abandoned*, not finished: nobody is awarded
+   * anything, the word is never revealed as an answer and the board is wiped,
+   * because a turn one player watched alone is not a turn that was played. The
+   * match itself survives — scores, round number and turn order all stay — so
+   * that `resumeIfPossible` can pick it up exactly where it stopped.
+   *
+   * Returns whether it actually paused, so callers can skip the work they were
+   * about to do to a match that is no longer running.
+   */
+  async pauseForMissingPlayers(room: RuntimeRoom): Promise<boolean> {
+    if (room.closed) return false;
+    if (!this.isLive(room.phase)) return false;
+    if (this.hasEnoughPlayers(room)) return false;
+
+    // Everything booked below belongs to a turn that will never finish: the
+    // selection deadline, the buzzer, the hints, the all-guessed grace, the
+    // scoreboard pause and the countdown into the first turn. The per-player
+    // reconnect timers are left alone on purpose — those are exactly what
+    // brings the missing player back.
+    timerService.cancelTurnTimers(room);
+    timerService.cancel(room, TIMER.roundResult);
+    timerService.cancel(room, TIMER.startCountdown);
+
+    // --- the critical section: every state change, before anything awaits ---
+    //
+    // Two players can leave in the same tick, and each arrives here on its own
+    // async chain. Node runs this synchronously, so the second call finds the
+    // phase already `paused` at its `isLive` check above and returns false
+    // rather than pausing the room a second time and announcing it twice. The
+    // same technique guards double-scoring in `submitGuess`.
+    const round = room.round;
+    // Marked ended before it is dropped, so any timer already past its
+    // `room.closed` check finds a round it must not touch.
+    if (round) round.ended = true;
+
+    const abandonedBoard = room.board.strokes;
+
+    room.round = null;
+    room.board = { strokes: [], redoStack: [] };
+    room.phase = GAME_PHASE.paused;
+
+    for (const player of room.players.values()) {
+      player.hasGuessed = false;
+      player.guessOrder = null;
+      player.roundScore = 0;
+    }
+    // ----------------------------------------------------------------------
+
+    if (round) {
+      await roundRepository
+        .finish(round.roundId, {
+          scoreDeltas: {},
+          snapshot: abandonedBoard,
+          endReason: 'aborted',
+        })
+        .catch((error: unknown) => {
+          logger.exception('recording an aborted round failed', error, {
+            roomId: room.roomId,
+            roundId: round.roundId,
+          });
+        });
+    }
+
+    await roomService.persist(room);
+
+    // The board goes too. Leaving the abandoned drawing up would hand the next
+    // guessers a free look at a word that is about to be offered again.
+    emitToRoom(room.roomId, SERVER_DRAW_CLEAR, {});
+    await this.broadcastState(room);
+    await chatService.system(
+      room,
+      `Waiting for more players. ${MIN_PLAYERS_TO_START} are needed to play.`,
+    );
+
+    logger.info('game paused for missing players', {
+      roomId: room.roomId,
+      active: this.activePlayers(room).length,
+      required: MIN_PLAYERS_TO_START,
+    });
+
+    return true;
+  }
+
+  /**
+   * Restarts a paused match once the room is back at strength.
+   *
+   * Called from every path that seats a socket — create, join and reconnect —
+   * so a game comes back on its own rather than waiting for the host to notice
+   * and press something.
+   */
+  async resumeIfPossible(room: RuntimeRoom): Promise<void> {
+    if (room.closed) return;
+    if (room.phase !== GAME_PHASE.paused) return;
+    if (!this.hasEnoughPlayers(room)) return;
+
+    // Anyone seated while the match was down joins the rotation for the rest
+    // of it. The ordinary mid-match joiner deliberately does not draw this
+    // game, but a paused room is the one case where that rule would deadlock:
+    // pausing at two players and resuming at two *different* ones would leave
+    // a turn order with nobody in it still here to take a turn.
+    for (const userId of room.players.keys()) {
+      if (!room.turnOrder.includes(userId)) room.turnOrder.push(userId);
+    }
+    // Departures shortened `turnOrder` underneath the cursor; `length` is the
+    // legal "this pass is done" value, so anything past it is clamped back.
+    if (room.turnIndex > room.turnOrder.length) room.turnIndex = room.turnOrder.length;
+
+    room.phase = GAME_PHASE.starting;
+    await roomService.persist(room);
+    await this.broadcastState(room);
+    await chatService.system(room, 'Enough players are here. Resuming...');
+
+    logger.info('game resumed', {
+      roomId: room.roomId,
+      active: this.activePlayers(room).length,
+    });
+
+    // The same beat `startGame` uses, for the same reason: clients get to play
+    // their countdown before the word-choice sheet appears.
+    timerService.schedule(room, TIMER.startCountdown, TIMING.startCountdownSeconds * 1000, () => {
+      void this.beginTurn(room).catch((error: unknown) => {
+        logger.exception('resuming a paused game failed', error, { roomId: room.roomId });
+      });
+    });
+  }
+
   // ------------------------------------------------------------------ start
 
   /**
@@ -214,6 +387,15 @@ export class GameService {
    */
   async beginTurn(room: RuntimeRoom): Promise<void> {
     if (room.closed) return;
+
+    // Checked here as well as on the way out of a turn: this is the single
+    // door every turn comes through — the start countdown, the scoreboard
+    // advance and a resume all land on it — so a room that lost somebody in
+    // the gap between those two moments still cannot open a turn.
+    if (!this.hasEnoughPlayers(room)) {
+      await this.pauseForMissingPlayers(room);
+      return;
+    }
 
     const drawerId = this.nextDrawerId(room);
 
@@ -589,6 +771,9 @@ export class GameService {
   ): Promise<void> {
     const round = room.round;
     if (!round || round.ended || room.closed) return;
+    // A paused match has already abandoned its round; scoring it now would pay
+    // out for a turn nobody was able to play.
+    if (room.phase === GAME_PHASE.paused) return;
 
     round.ended = true;
     timerService.cancelTurnTimers(room);
@@ -663,6 +848,14 @@ export class GameService {
   /** Moves to the next turn, the next round, or the end of the game. */
   private async advance(room: RuntimeRoom): Promise<void> {
     if (room.closed) return;
+    // The scoreboard timer outlives the pause that cancelled it only if the
+    // two raced; either way a paused match does not advance.
+    if (room.phase === GAME_PHASE.paused) return;
+
+    if (!this.hasEnoughPlayers(room)) {
+      await this.pauseForMissingPlayers(room);
+      return;
+    }
 
     room.turnIndex += 1;
 
@@ -838,12 +1031,24 @@ export class GameService {
   /**
    * Handles any player leaving mid-match.
    *
-   * Two things can end the turn early: the drawer going, or so many guessers
-   * going that everyone still present has already guessed.
+   * The minimum-player rule is checked first and before anything reads
+   * `room.round`, because it is the one case that applies in *every* live
+   * phase — including the two this method used to return from immediately:
+   * the countdown before the first turn, where there is no round yet, and the
+   * scoreboard between turns, where the round has already ended. Leaving in
+   * either of those is exactly how a two-player game used to end up with one
+   * player and a next turn scheduled for them alone.
+   *
+   * Past that, two things can still end a turn early: the drawer going, or so
+   * many guessers going that everyone still present has already guessed.
    */
   async onPlayerLeft(room: RuntimeRoom, userId: string): Promise<void> {
+    if (room.closed) return;
+
+    if (await this.pauseForMissingPlayers(room)) return;
+
     const round = room.round;
-    if (!round || round.ended || room.closed) return;
+    if (!round || round.ended) return;
 
     if (round.drawerId === userId) {
       await chatService.system(room, 'The drawer left.');
