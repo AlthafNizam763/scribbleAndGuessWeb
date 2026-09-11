@@ -33,6 +33,16 @@ services:
     healthCheckPath: /api/health
 
     envVars:
+      # Must be exactly "production", and it must not be "development".
+      #
+      # Render applies a service's environment to the build step as well as to
+      # the running process, and `next build` with NODE_ENV=development in the
+      # environment fails while prerendering /404 with
+      #   Error: <Html> should not be imported outside of pages/_document
+      # which names neither NODE_ENV nor the real problem. `npm run build` now
+      # pins the value itself, so this is belt and braces — but if you add
+      # variables through the dashboard, do not paste NODE_ENV=development from
+      # .env.example.
       - key: NODE_ENV
         value: production
 
