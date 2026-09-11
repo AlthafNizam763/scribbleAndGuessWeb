@@ -63,3 +63,28 @@ export const playerProfileSchema = z.object({
   avatarId: avatarIdSchema.default(0),
   avatarColorIndex: avatarColorSchema.default(0),
 });
+
+/**
+ * The display profile a client attaches to `c:hello`, `c:room:create` and
+ * `c:room:join`, used to mirror the device's chosen name and avatar onto the
+ * user row (see `socket/profile.sync.ts`).
+ *
+ * Two differences from [playerProfileSchema], and both matter. Every field is
+ * optional, because an older client may send only some of them. And nothing
+ * falls back to a placeholder: the schemas above turn an unusable name into
+ * `'Player'` and an unusable avatar into `0`, which is right when the value is
+ * being *read*, but catastrophic when it is being *written* — a client with a
+ * garbled payload would silently rename the player to `Player` and reset their
+ * face. Here an unusable value simply fails, and the caller leaves the stored
+ * one alone.
+ */
+export const profileSyncSchema = z.object({
+  name: usernameSchema.optional(),
+  avatarId: z.coerce.number().int().min(0).max(INPUT_LIMITS.avatarCount - 1).optional(),
+  avatarColorIndex: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(INPUT_LIMITS.avatarColorCount - 1)
+    .optional(),
+});

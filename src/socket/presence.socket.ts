@@ -12,7 +12,8 @@ import { roomService } from '@/services/room.service';
 import { userRepository } from '@/repositories/user.repository';
 import { roomRepository } from '@/repositories/room.repository';
 import { on } from '@/socket/handler';
-import type { GameSocket } from '@/types/socket.types';
+import { syncSocketProfile } from '@/socket/profile.sync';
+import type { GameSocket, RuntimePlayer } from '@/types/socket.types';
 import { timePingSchema } from '@/validators/game.validator';
 import { logger } from '@/utils/logger';
 
@@ -44,10 +45,18 @@ export function registerPresenceHandlers(socket: GameSocket): void {
   on(
     socket,
     CLIENT_HELLO,
-    async ({ socket: sock, userId }) => {
+    async ({ socket: sock, userId }, payload) => {
       // The profile in the payload is display data only. The identity that
-      // matters came from the verified token in the handshake middleware.
+      // matters came from the verified token in the handshake middleware, so
+      // only the name and avatar are taken from it and the id it carries is
+      // ignored.
+      //
+      // Awaited, and awaited *before* the seat is restored: the account was
+      // created under a placeholder name at app launch, and this is where the
+      // device's real one lands. Restoring the seat first would broadcast the
+      // placeholder one more time.
       void userRepository.touch(userId);
+      await syncSocketProfile(sock, payload);
 
       const restored = await restoreSeat(sock, userId);
 
@@ -138,10 +147,33 @@ async function seat(socket: GameSocket, roomId: string): Promise<void> {
   socket.join(roomChannel(roomId));
   socket.data.roomId = roomId;
 
+  // Take the current profile, exactly as `joinRoom` does: a player who renamed
+  // themselves between sessions comes back under the new name rather than the
+  // one frozen into the seat when they first sat down. Mirrored to storage
+  // only when it actually moved — this runs on every reconnect, and a room
+  // write per reconnect would be a write for nothing almost every time.
+  const seated = room.players.get(socket.data.user.id);
+  if (seated && stale(seated, socket)) {
+    seated.username = socket.data.user.username;
+    seated.avatarId = socket.data.user.avatarId;
+    seated.avatarColorIndex = socket.data.user.avatarColorIndex;
+    await roomService.persist(room);
+  }
+
   presenceService.attach(room, socket.data.user.id, socket.id);
 
   socket.emit(SERVER_DRAW_SNAPSHOT, { strokes: drawingService.snapshot(room) });
   await gameService.broadcastState(room);
 
   logger.info('player restored to room', { roomId, userId: socket.data.user.id });
+}
+
+/** Whether a seat is showing a name or face the account has since changed. */
+function stale(player: RuntimePlayer, socket: GameSocket): boolean {
+  const { username, avatarId, avatarColorIndex } = socket.data.user;
+  return (
+    player.username !== username ||
+    player.avatarId !== avatarId ||
+    player.avatarColorIndex !== avatarColorIndex
+  );
 }

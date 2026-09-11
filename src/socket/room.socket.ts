@@ -32,6 +32,7 @@ import { moderationService } from '@/services/moderation.service';
 import { presenceService } from '@/services/presence.service';
 import { roomService, defaultSettings } from '@/services/room.service';
 import { on, type HandlerContext } from '@/socket/handler';
+import { syncSocketProfile } from '@/socket/profile.sync';
 import type { GameSocket, RuntimeRoom } from '@/types/socket.types';
 import { errors } from '@/utils/errors';
 
@@ -99,6 +100,12 @@ export function registerRoomHandlers(socket: GameSocket): void {
         ? roomSettingsSchema.parse(body.settings)
         : defaultSettings();
 
+      // Before the seat is cut, not after: `createRoom` stamps the host's seat
+      // from `socket.data.user`, so the name and avatar the device is showing
+      // have to be on the row by now or the lobby renders the placeholder the
+      // account was created with.
+      await syncSocketProfile(sock, payload);
+
       // A socket can only be in one room, so creating a second one leaves the
       // first rather than silently seating the player in two.
       await leaveCurrentRoom(sock);
@@ -122,6 +129,11 @@ export function registerRoomHandlers(socket: GameSocket): void {
 
       const room = roomService.getByCode(code);
       if (!room) throw errors.roomNotFound();
+
+      // Same reason as create, plus one: the presence line below quotes the
+      // username, and announcing "Player joined." to a room is exactly the
+      // symptom this sync exists to remove.
+      await syncSocketProfile(sock, payload);
 
       await leaveCurrentRoom(sock);
 
