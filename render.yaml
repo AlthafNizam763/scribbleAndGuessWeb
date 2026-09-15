@@ -85,6 +85,33 @@ services:
       - key: LOG_LEVEL
         value: info
 
+      # --- voice chat (WebRTC) ---------------------------------------------
+      #
+      # Only signalling passes through this service; the audio itself goes
+      # peer to peer and never reaches the server, so voice adds no bandwidth
+      # cost to this plan.
+      #
+      # STUN is free and sufficient for most networks. The default below is
+      # Google's public server, which is what makes voice work with nothing
+      # configured at all.
+      - key: WEBRTC_STUN_URL
+        value: stun:stun.l.google.com:19302
+
+      # TURN is the fallback for peers behind a symmetric NAT that STUN cannot
+      # traverse. It is optional, it is NOT free — every byte of audio is
+      # relayed — and it needs a server you run (Coturn). Left unset, voice
+      # still works for the large majority of players and simply fails to
+      # connect for the rest.
+      #
+      # `sync: false` keeps the credential out of this file and in Render's
+      # dashboard. Never commit a TURN password.
+      - key: WEBRTC_TURN_URL
+        sync: false
+      - key: WEBRTC_TURN_USERNAME
+        sync: false
+      - key: WEBRTC_TURN_CREDENTIAL
+        sync: false
+
     # A drawing game is stateful in memory: the live room registry belongs to
     # this process, and a player's socket must keep reaching the instance that
     # holds their room. Scaling past one instance needs the Redis adapter (see

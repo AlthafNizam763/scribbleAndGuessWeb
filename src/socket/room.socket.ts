@@ -6,6 +6,7 @@ import {
   CLIENT_ROOM_KICK,
   CLIENT_ROOM_LEAVE,
   CLIENT_ROOM_MUTE,
+  CLIENT_ROOM_QUICK_PLAY,
   CLIENT_ROOM_READY,
   CLIENT_ROOM_REPORT,
   CLIENT_ROOM_SETTINGS,
@@ -13,6 +14,7 @@ import {
   CLIENT_ROOM_VOTE_KICK,
   SERVER_DRAW_SNAPSHOT,
   SERVER_ROOM_CLOSED,
+  SERVER_VOICE_STATE,
   roomChannel,
 } from '@/constants/socket.constants';
 import { parsePayload } from '@/middleware/validation.middleware';
@@ -28,9 +30,11 @@ import {
 import { chatService } from '@/services/chat.service';
 import { drawingService } from '@/services/drawing.service';
 import { gameService } from '@/services/game.service';
+import { matchmakingService } from '@/services/matchmaking.service';
 import { moderationService } from '@/services/moderation.service';
 import { presenceService } from '@/services/presence.service';
 import { roomService, defaultSettings } from '@/services/room.service';
+import { voiceService } from '@/services/voice.service';
 import { on, type HandlerContext } from '@/socket/handler';
 import { syncSocketProfile } from '@/socket/profile.sync';
 import type { GameSocket, RuntimeRoom } from '@/types/socket.types';
@@ -69,6 +73,10 @@ async function enterRoom(socket: GameSocket, room: RuntimeRoom): Promise<void> {
   // The board as it stands, so a late joiner or a returning player sees the
   // drawing already in progress rather than a blank canvas.
   socket.emit(SERVER_DRAW_SNAPSHOT, { strokes: drawingService.snapshot(room) });
+
+  // And whether they may speak. Somebody who joins mid-turn is a guesser and
+  // should be in voice immediately rather than waiting for the next round.
+  socket.emit(SERVER_VOICE_STATE, voiceService.stateFor(room, socket.data.user.id));
 }
 
 /** Removes a socket from a room, closing the room if it empties. */
@@ -133,7 +141,11 @@ export function registerRoomHandlers(socket: GameSocket): void {
       const body = parsePayload(payload, joinRoomSchema);
       const code = body.roomCode ?? body.code ?? '';
 
-      const room = roomService.getByCode(code);
+      // `resolveByCode` rather than `getByCode`: a room created by the REST
+      // process, or one that outlived a restart, is live and joinable but not
+      // in this process's registry yet. An unknown or closed code still comes
+      // back null and still produces the same refusal.
+      const room = await roomService.resolveByCode(code);
       if (!room) throw errors.roomNotFound();
 
       // Same reason as create, plus one: the presence line below quotes the
@@ -153,6 +165,52 @@ export function registerRoomHandlers(socket: GameSocket): void {
       return { room: roomService.serializeRoom(room) };
     },
     { limit: 'joinRoom' },
+  );
+
+  // -------------------------------------------------------------- quick play
+
+  /**
+   * Quick Play.
+   *
+   * The same three-step shape as join — match, seat, enter — with the matching
+   * delegated to `matchmakingService`, which is also what the REST endpoint
+   * calls. There is no second engine and no second room shape here: what comes
+   * back is an ordinary public room that anybody can later join by its code.
+   *
+   * Matchmaking reads the live registry, which is why this exists as a socket
+   * event at all: "is there a seat free right now" is only answerable in the
+   * process holding the rooms, and the seat it produces has to be a socket
+   * seat.
+   */
+  on(
+    socket,
+    CLIENT_ROOM_QUICK_PLAY,
+    async ({ socket: sock }, payload) => {
+      // Before matchmaking: the seat is cut from `socket.data.user`, and the
+      // presence line below quotes the username.
+      await syncSocketProfile(sock, payload);
+
+      const outcome = await matchmakingService.quickPlay(sock.data.user);
+
+      // Already in this very room — a second tap, or a player who reached the
+      // button from inside a game. Re-enter for a fresh snapshot, but announce
+      // nothing and do not leave first: they never went anywhere.
+      const wasHere = sock.data.roomId === outcome.room.roomId;
+      if (!wasHere) await leaveCurrentRoom(sock);
+
+      await enterRoom(sock, outcome.room);
+
+      if (!outcome.alreadySeated) {
+        await chatService.presence(outcome.room, `${sock.data.user.username} joined.`, true);
+      }
+
+      return {
+        room: roomService.serializeRoom(outcome.room),
+        created: outcome.created,
+        alreadySeated: outcome.alreadySeated,
+      };
+    },
+    { limit: 'quickPlay' },
   );
 
   // ------------------------------------------------------------------- leave

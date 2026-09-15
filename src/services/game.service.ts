@@ -19,6 +19,7 @@ import { hintSchedule, letterCount, maskWord, nextHintIndices } from '@/services
 import { roomService } from '@/services/room.service';
 import { scoringService } from '@/services/scoring.service';
 import { TIMER, timerService } from '@/services/timer.service';
+import { voiceService } from '@/services/voice.service';
 import { wordService } from '@/services/word.service';
 import type {
   GameResultDto,
@@ -140,8 +141,23 @@ export class GameService {
     };
   }
 
-  /** Broadcasts room state, then per-recipient game state. */
+  /**
+   * Broadcasts room state, then per-recipient game state.
+   *
+   * Voice membership is re-derived first, before either broadcast goes out.
+   * This is the one funnel every state change already passes through — a turn
+   * opening, the pen changing hands, a pause, a resume, a departure, a
+   * reconnect — so hanging the outgoing drawer up here means there is no list
+   * of other call sites that each have to remember to. Doing it *before* the
+   * broadcast also gets the order right on the wire: the new drawer is told
+   * their voice is off, and only then told they are drawing.
+   *
+   * It costs nothing when nothing moved: `reconcile` returns immediately for
+   * a room with an empty voice group, which is every room outside a turn.
+   */
   async broadcastState(room: RuntimeRoom): Promise<void> {
+    voiceService.reconcile(room);
+
     emitToRoom(room.roomId, SERVER_ROOM_STATE, { room: roomService.serializeRoom(room) });
     await emitPerViewer(room.roomId, SERVER_GAME_STATE, (viewerId) => ({
       game: this.serializeGameState(room, viewerId),

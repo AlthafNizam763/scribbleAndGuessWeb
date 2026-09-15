@@ -31,6 +31,21 @@ interface HandlerOptions {
   limit?: RateLimitName;
   /** Whether the caller must already be seated in a room. */
   requiresRoom?: boolean;
+  /**
+   * A feature-specific event to report failures on, instead of `s:error`.
+   *
+   * Voice signalling needs this. Its offer, answer and candidate frames are
+   * fire-and-forget — a round trip per ICE candidate would slow connection
+   * setup for no benefit — so a refusal has nowhere to land, and on `s:error`
+   * it would be indistinguishable from any other out-of-band failure. Sending
+   * it on `s:voice:error` instead is what lets the client tear its microphone
+   * down on `DRAWER_VOICE_DISABLED` without having to guess which subsystem
+   * the error came from.
+   *
+   * The REST-flavoured `ErrorCode` rides along in the payload, because that is
+   * the name the brief's security test looks for.
+   */
+  errorEvent?: string;
 }
 
 /** What a handler receives. */
@@ -128,7 +143,19 @@ export function on(
 
         // A client that sent no ack would otherwise never learn the action
         // failed, so the failure is also pushed out of band.
-        if (!ack && !response.ok) socket.emit(SERVER_ERROR, { error: response.error });
+        if (response.ok) return;
+
+        if (options.errorEvent) {
+          socket.emit(options.errorEvent, {
+            // The `ErrorCode` name, not the wire code: `DRAWER_VOICE_DISABLED`
+            // is what this event exists to be able to say.
+            code: AppError.isAppError(error) ? error.code : ErrorCode.VALIDATION_ERROR,
+            message: response.error.message,
+          });
+          return;
+        }
+
+        if (!ack) socket.emit(SERVER_ERROR, { error: response.error });
       }
     })();
   };

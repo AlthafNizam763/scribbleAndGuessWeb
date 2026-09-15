@@ -73,6 +73,20 @@ const schema = z.object({
 
   CORS_ORIGIN: z.string().default('*'),
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
+
+  /**
+   * Voice chat's ICE configuration (brief: free STUN, optional self-hosted
+   * TURN). Handed to clients over `s:voice:state` rather than compiled into
+   * them, so a TURN server can be introduced — or its credentials rotated —
+   * without shipping a new app build, and so no credential is ever written
+   * down in the client bundle.
+   *
+   * Comma-separated lists are accepted for both URL variables.
+   */
+  WEBRTC_STUN_URL: z.string().default('stun:stun.l.google.com:19302'),
+  WEBRTC_TURN_URL: z.string().default(''),
+  WEBRTC_TURN_USERNAME: z.string().default(''),
+  WEBRTC_TURN_CREDENTIAL: z.string().default(''),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -126,6 +140,21 @@ export const env = {
   corsOrigins: raw.CORS_ORIGIN === '*' ? '*' : raw.CORS_ORIGIN.split(',').map((o) => o.trim()),
 
   logLevel: raw.LOG_LEVEL,
+
+  /** STUN URLs, in preference order. Empty disables STUN entirely. */
+  webrtcStunUrls: splitUrls(raw.WEBRTC_STUN_URL),
+  /** TURN URLs. Empty — the default — means no relay fallback is configured. */
+  webrtcTurnUrls: splitUrls(raw.WEBRTC_TURN_URL),
+  webrtcTurnUsername: raw.WEBRTC_TURN_USERNAME,
+  webrtcTurnCredential: raw.WEBRTC_TURN_CREDENTIAL,
 } as const;
+
+/** Splits a comma-separated URL list, dropping blanks. */
+function splitUrls(value: string): string[] {
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
 
 export type Env = typeof env;

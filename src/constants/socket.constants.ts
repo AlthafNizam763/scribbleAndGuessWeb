@@ -26,6 +26,17 @@ export const CLIENT_TIME_PING = 'c:time:ping';
 export const CLIENT_ROOM_CREATE = 'c:room:create';
 /** Joins an existing room by code. */
 export const CLIENT_ROOM_JOIN = 'c:room:join';
+/**
+ * Finds a joinable public room and seats the caller in it, creating one when
+ * nothing suitable is open.
+ *
+ * The Quick Play button. A socket event rather than only a REST call because
+ * the live room registry is process-local: matchmaking has to run where the
+ * rooms actually are, and the seat it produces has to be a *socket* seat. The
+ * REST `POST /api/rooms/quick-play` shares the same matchmaking service and is
+ * there for clients that are not holding a connection yet.
+ */
+export const CLIENT_ROOM_QUICK_PLAY = 'c:room:quickPlay';
 /** Leaves the current room. */
 export const CLIENT_ROOM_LEAVE = 'c:room:leave';
 /** Sets the ready flag of the calling player. */
@@ -64,6 +75,21 @@ export const CLIENT_DRAW_REDO = 'c:draw:redo';
 export const CLIENT_DRAW_CLEAR = 'c:draw:clear';
 /** Sends a chat message, which doubles as a guess while drawing. */
 export const CLIENT_CHAT_SEND = 'c:chat:send';
+
+// --- voice (WebRTC signalling only; no audio ever crosses this socket) ------
+
+/** Asks to join the room's voice group. Refused for the current drawer. */
+export const CLIENT_VOICE_JOIN = 'c:voice:join';
+/** Leaves the voice group. Always allowed. */
+export const CLIENT_VOICE_LEAVE = 'c:voice:leave';
+/** Relays an SDP offer to one peer. */
+export const CLIENT_VOICE_OFFER = 'c:voice:offer';
+/** Relays an SDP answer to one peer. */
+export const CLIENT_VOICE_ANSWER = 'c:voice:answer';
+/** Relays one ICE candidate to one peer. */
+export const CLIENT_VOICE_ICE = 'c:voice:ice';
+/** Publishes the caller's microphone state to the voice group. */
+export const CLIENT_VOICE_MUTE = 'c:voice:mute';
 
 // ---------------------------------------------------------------------------
 // Server -> client
@@ -108,6 +134,93 @@ export const SERVER_TIME_SYNC = 's:time:sync';
 /** An out-of-band failure that is not tied to a single ack. */
 export const SERVER_ERROR = 's:error';
 
+// --- voice ------------------------------------------------------------------
+
+/**
+ * The recipient's own voice status: whether voice is on for them right now,
+ * which ICE servers to use, and which peers they should be connected to.
+ *
+ * Sent on join, and again whenever the server takes voice away from them —
+ * which is what makes a player who has just become the drawer hang up even if
+ * their client never noticed the pen changed hands.
+ */
+export const SERVER_VOICE_STATE = 's:voice:state';
+/** Somebody joined the voice group. */
+export const SERVER_VOICE_PEER_JOINED = 's:voice:peerJoined';
+/** Somebody left the voice group, or was removed from it. */
+export const SERVER_VOICE_PEER_LEFT = 's:voice:peerLeft';
+/** An SDP offer from one peer. */
+export const SERVER_VOICE_OFFER = 's:voice:offer';
+/** An SDP answer from one peer. */
+export const SERVER_VOICE_ANSWER = 's:voice:answer';
+/** One ICE candidate from one peer. */
+export const SERVER_VOICE_ICE = 's:voice:ice';
+/** A peer muted or unmuted their microphone. */
+export const SERVER_VOICE_MUTE = 's:voice:mute';
+/** A refused voice operation, carrying the `ErrorCode` that refused it. */
+export const SERVER_VOICE_ERROR = 's:voice:error';
+
+// --- friends ----------------------------------------------------------------
+
+/**
+ * The friend-list pushes, each under two names.
+ *
+ * `canonical` is the `s:friend:*` spelling every other server-to-client event
+ * in this file uses. `alias` is the flatter `friend:*` spelling the brief
+ * names. Both are emitted to the same user channel with the same payload, so a
+ * client written against either vocabulary works and neither has to be
+ * migrated later. A client listens for one or the other, never both, so
+ * nothing sees the event twice.
+ *
+ * These are addressed to a *user*, not to a room: they go out on
+ * `userChannel`, which reaches every device that person is signed in on.
+ *
+ * Note what is absent. There is no `friend:blocked` sent to the person who was
+ * blocked, because being told would be exactly the disclosure the brief
+ * forbids. Blocking notifies the blocker only, and the blocked party sees
+ * nothing but a friendship that quietly ended — which they would have seen
+ * anyway.
+ */
+export const FRIEND_EVENTS = {
+  /** Somebody asked to be your friend. Sent to the receiver. */
+  requestReceived: {
+    canonical: 's:friend:requestReceived',
+    alias: 'friend:request_received',
+  },
+  /** Your request was accepted. Sent to the original sender. */
+  requestAccepted: {
+    canonical: 's:friend:requestAccepted',
+    alias: 'friend:request_accepted',
+  },
+  /** Your request was declined. Sent to the original sender. */
+  requestRejected: {
+    canonical: 's:friend:requestRejected',
+    alias: 'friend:request_rejected',
+  },
+  /** A request pointing at you was withdrawn. Sent to the receiver. */
+  requestCancelled: {
+    canonical: 's:friend:requestCancelled',
+    alias: 'friend:request_cancelled',
+  },
+  /** A friendship ended. Sent to the other party. */
+  removed: {
+    canonical: 's:friend:removed',
+    alias: 'friend:removed',
+  },
+  /** A block was placed. Sent to the blocker, and only to them. */
+  blocked: {
+    canonical: 's:friend:blocked',
+    alias: 'friend:blocked',
+  },
+  /** A block was lifted. Sent to the blocker, and only to them. */
+  unblocked: {
+    canonical: 's:friend:unblocked',
+    alias: 'friend:unblocked',
+  },
+} as const satisfies Record<string, { canonical: string; alias: string }>;
+
+export type FriendEventName = keyof typeof FRIEND_EVENTS;
+
 /**
  * Alternate inbound names from the brief's section 16.
  *
@@ -118,6 +231,7 @@ export const SERVER_ERROR = 's:error';
  */
 export const ALIASES: Readonly<Record<string, string>> = Object.freeze({
   'room:join': CLIENT_ROOM_JOIN,
+  'room:quick_play': CLIENT_ROOM_QUICK_PLAY,
   'room:leave': CLIENT_ROOM_LEAVE,
   'player:ready': CLIENT_ROOM_READY,
   'game:start': CLIENT_GAME_START,
@@ -135,6 +249,12 @@ export const ALIASES: Readonly<Record<string, string>> = Object.freeze({
   'moderation:mute': CLIENT_ROOM_MUTE,
   'moderation:report': CLIENT_ROOM_REPORT,
   'moderation:vote_kick': CLIENT_ROOM_VOTE_KICK,
+  'voice:join': CLIENT_VOICE_JOIN,
+  'voice:leave': CLIENT_VOICE_LEAVE,
+  'voice:offer': CLIENT_VOICE_OFFER,
+  'voice:answer': CLIENT_VOICE_ANSWER,
+  'voice:ice_candidate': CLIENT_VOICE_ICE,
+  'voice:mute': CLIENT_VOICE_MUTE,
 });
 
 /** Socket.IO room name for a game room. */
@@ -142,3 +262,14 @@ export const roomChannel = (roomId: string): string => `room:${roomId}`;
 
 /** Socket.IO room name that reaches every socket of one user. */
 export const userChannel = (userId: string): string => `user:${userId}`;
+
+/**
+ * Socket.IO room name for a game room's voice group.
+ *
+ * Deliberately *not* `roomChannel`. The drawer sits in the room channel and
+ * must never receive voice traffic, so the voice fan-out gets a channel of its
+ * own that only current guessers are ever joined to. That is what makes "the
+ * drawer cannot hear anybody" true at the transport level rather than only in
+ * the handlers.
+ */
+export const voiceChannel = (roomId: string): string => `voice:${roomId}`;

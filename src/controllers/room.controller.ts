@@ -1,14 +1,18 @@
 import type { NextResponse } from 'next/server';
 
 import { connectToDatabase } from '@/config/database';
+import { getSocketServer } from '@/config/socket';
 import { requireUser } from '@/middleware/auth.middleware';
 import { ok } from '@/middleware/error.middleware';
 import { clientIdentity, enforceHttpLimit } from '@/middleware/rateLimit.middleware';
 import { parseBody } from '@/middleware/validation.middleware';
+import { roomRepository } from '@/repositories/room.repository';
 import { chatService } from '@/services/chat.service';
 import { gameService } from '@/services/game.service';
 import { lobbyService } from '@/services/lobby.service';
+import { matchmakingService, quickPlaySettings } from '@/services/matchmaking.service';
 import { roomService } from '@/services/room.service';
+import { quickPlaySchema } from '@/validators/social.validator';
 import {
   createRoomSchema,
   joinRoomSchema,
@@ -71,6 +75,96 @@ export const roomController = {
     }
 
     return ok({ room: roomService.serializeRoom(room) });
+  },
+
+  /**
+   * `POST /api/rooms/quick-play` (brief section 2)
+   *
+   * Finds a public room with a free seat and puts the caller in it, opening
+   * one when nothing suitable is waiting. Takes no parameters: the point of
+   * the button is that there is nothing to decide.
+   *
+   * ## Two deployments, two paths
+   *
+   * The live room registry is process-local. When this process is also the one
+   * holding the sockets — which is what `server.ts` builds, and the default —
+   * matchmaking runs against that registry and the caller is genuinely seated
+   * here. Their socket picks the seat up on its next handshake, exactly as it
+   * does for a room created over REST today.
+   *
+   * When the realtime server runs as a separate process (`socket-server.ts`),
+   * this one has no registry to read or to seat anybody in. It falls back to
+   * naming a room out of Mongo and hands back the code with `joined: false`,
+   * and the client joins it over the socket — where the authoritative checks
+   * run anyway. Creating is safe from either process because the room row is
+   * written before anybody sits down.
+   *
+   * `joined` is in the response precisely so a client never has to guess which
+   * of the two happened.
+   */
+  async quickPlay(request: Request): Promise<NextResponse> {
+    const user = await requireUser(request);
+    enforceHttpLimit('quickPlay', clientIdentity(request, user.id));
+
+    await connectToDatabase();
+
+    // Body is ignored; parsed only so a malformed one fails predictably.
+    await parseBody(request, quickPlaySchema);
+
+    if (getSocketServer() !== null) {
+      const outcome = await matchmakingService.quickPlay(user);
+
+      // A room the caller was already in is not a new arrival, so it gets no
+      // presence line and no broadcast — they never left.
+      if (!outcome.alreadySeated) {
+        await chatService.presence(outcome.room, `${user.username} joined.`, true);
+        await gameService.broadcastState(outcome.room);
+      }
+
+      return ok({
+        room: roomService.serializeRoom(outcome.room),
+        roomCode: outcome.room.code,
+        created: outcome.created,
+        alreadySeated: outcome.alreadySeated,
+        joined: true,
+      });
+    }
+
+    const existing = await roomRepository.findLiveForUser(user.id);
+    const live = existing.find((room) => !room.closedAt);
+    if (live) {
+      return ok({
+        room: null,
+        roomCode: live.roomCode,
+        created: false,
+        alreadySeated: true,
+        joined: false,
+      });
+    }
+
+    const candidate = await matchmakingService.findCandidateDescriptor(user.id);
+    if (candidate) {
+      return ok({
+        room: null,
+        roomCode: candidate.roomCode,
+        created: false,
+        alreadySeated: false,
+        joined: false,
+      });
+    }
+
+    const room = await roomService.createRoom({ owner: user, settings: quickPlaySettings() });
+
+    return ok(
+      {
+        room: roomService.serializeRoom(room),
+        roomCode: room.code,
+        created: true,
+        alreadySeated: false,
+        joined: false,
+      },
+      201,
+    );
   },
 
   /** `GET /api/rooms/:roomId` */

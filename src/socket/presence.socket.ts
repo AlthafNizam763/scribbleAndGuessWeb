@@ -2,6 +2,7 @@ import {
   CLIENT_HELLO,
   CLIENT_TIME_PING,
   SERVER_DRAW_SNAPSHOT,
+  SERVER_VOICE_STATE,
   roomChannel,
 } from '@/constants/socket.constants';
 import { parsePayload } from '@/middleware/validation.middleware';
@@ -9,6 +10,7 @@ import { drawingService } from '@/services/drawing.service';
 import { gameService } from '@/services/game.service';
 import { presenceService } from '@/services/presence.service';
 import { roomService } from '@/services/room.service';
+import { voiceService } from '@/services/voice.service';
 import { userRepository } from '@/repositories/user.repository';
 import { roomRepository } from '@/repositories/room.repository';
 import { on } from '@/socket/handler';
@@ -100,6 +102,18 @@ export function registerPresenceHandlers(socket: GameSocket): void {
     const room = roomService.get(roomId);
     if (!room) return;
 
+    // Voice, unlike the seat, does not survive the drop. A peer connection to
+    // a socket that is gone is dead the moment the socket is, so the group is
+    // told now rather than waiting for each remaining peer's ICE to time out
+    // on its own. The player rejoins voice when their client reconnects and
+    // sees it is still a guesser.
+    //
+    // Guarded on the socket id so a player on two devices closing one of them
+    // does not hang up the other.
+    if (room.voice.members.get(userId)?.socketId === socket.id) {
+      voiceService.leave(room, userId, 'disconnected');
+    }
+
     // The seat is kept. Only the grace period expiring actually removes them,
     // which is what lets a dropped connection be survivable.
     const { wentOffline } = presenceService.detach(room, userId, socket.id);
@@ -168,6 +182,12 @@ async function seat(socket: GameSocket, roomId: string): Promise<void> {
 
   socket.emit(SERVER_DRAW_SNAPSHOT, { strokes: drawingService.snapshot(room) });
   await gameService.broadcastState(room);
+
+  // Whether this player may speak is decided here, not by their client
+  // remembering what it was doing before the drop. A guesser who reconnects as
+  // the new drawer gets `enabled: false` and never asks to join; a guesser who
+  // is still a guesser gets the peer list and rebuilds its mesh.
+  socket.emit(SERVER_VOICE_STATE, voiceService.stateFor(room, socket.data.user.id));
 
   logger.info('player restored to room', { roomId, userId: socket.data.user.id });
 }

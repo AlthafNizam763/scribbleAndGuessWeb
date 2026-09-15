@@ -126,6 +126,22 @@ roomSchema.index(
 roomSchema.index({ closedAt: 1, updatedAt: 1 });
 roomSchema.index({ 'players.userId': 1 });
 
+/**
+ * The Quick Play candidate scan.
+ *
+ * Every key is an equality or set predicate except the last, which is the
+ * sort. `closedAt` leads because it is the one filter every room query shares,
+ * then the two that narrow hardest — public, and open to joining — and finally
+ * `createdAt` so "oldest waiting room first" comes off the index instead of a
+ * blocking sort.
+ *
+ * Only the fallback path in `roomRepository.findJoinablePublic` uses this. In
+ * the single-process deployment matchmaking reads the in-memory registry and
+ * touches no index at all; this is what keeps the split deployment's REST side
+ * from doing a collection scan for every Play tap.
+ */
+roomSchema.index({ closedAt: 1, 'settings.isPrivate': 1, status: 1, createdAt: 1 });
+
 export type RoomDocument = InferSchemaType<typeof roomSchema> & { _id: Types.ObjectId };
 export type RoomPlayerDocument = InferSchemaType<typeof roomPlayerSchema>;
 export type RoomSettingsDocument = InferSchemaType<typeof roomSettingsSchema>;

@@ -97,6 +97,56 @@ export const roomRepository = {
     ).exec();
   },
 
+  /**
+   * Public rooms that look joinable, for Quick Play.
+   *
+   * ## Why this exists beside the live registry
+   *
+   * Matchmaking normally runs against the in-memory registry, which is exact:
+   * it knows who is seated this instant. That registry is process-local, so a
+   * deployment that runs the REST API and the realtime server as two processes
+   * (see `socket-server.ts`) has no registry on the REST side at all. This
+   * query is what `POST /api/rooms/quick-play` falls back to there.
+   *
+   * The result is a *hint*, not a decision. The player counts come from the
+   * last write-through, so a room can fill between this query and the join,
+   * and the caller is expected to try the next candidate when that happens.
+   * The authoritative refusal is still `roomService.joinRoom`.
+   *
+   * `status` is filtered rather than `phase` because only the coarse status is
+   * mirrored into Mongo, and it is the right question anyway: "can this be
+   * joined", not "what is happening this second".
+   */
+  async findJoinablePublic(input: {
+    limit: number;
+    excludeUserId?: string;
+    excludeRoomIds?: string[];
+  }) {
+    const filter: Record<string, unknown> = {
+      closedAt: null,
+      'settings.isPrivate': false,
+      status: { $in: [ROOM_STATUS.waiting, ROOM_STATUS.starting] },
+    };
+
+    // A room this player is banned from is not a candidate, and neither is one
+    // they are already seated in — Quick Play would otherwise "find" the room
+    // they are standing in and call it a match.
+    if (input.excludeUserId) {
+      filter.bannedUserIds = { $ne: input.excludeUserId };
+    }
+    if (input.excludeRoomIds && input.excludeRoomIds.length > 0) {
+      filter._id = { $nin: input.excludeRoomIds.filter(isObjectId) };
+    }
+
+    return Room.find(filter)
+      // Oldest first, so Quick Play fills the room that has been waiting
+      // longest instead of scattering players across fresh ones.
+      .sort({ createdAt: 1 })
+      .limit(input.limit)
+      .lean()
+      .exec();
+  },
+
   /** Rooms that have been closed long enough to delete outright. */
   async findSweepable(olderThan: Date) {
     return Room.find({ closedAt: { $ne: null, $lt: olderThan } })

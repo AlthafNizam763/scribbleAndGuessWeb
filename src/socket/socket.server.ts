@@ -9,6 +9,7 @@ import { registerDrawingHandlers } from '@/socket/drawing.socket';
 import { registerGameHandlers } from '@/socket/game.socket';
 import { registerPresenceHandlers } from '@/socket/presence.socket';
 import { registerRoomHandlers } from '@/socket/room.socket';
+import { registerVoiceHandlers } from '@/socket/voice.socket';
 import { installSocketAuth } from '@/socket/socket.auth';
 import type { GameServer, GameSocket } from '@/types/socket.types';
 import { logger } from '@/utils/logger';
@@ -40,6 +41,7 @@ export function attachSocketServer(httpServer: HttpServer): GameServer {
     registerGameHandlers(gameSocket);
     registerDrawingHandlers(gameSocket);
     registerChatHandlers(gameSocket);
+    registerVoiceHandlers(gameSocket);
 
     // Seeds the client's clock estimate immediately, so a countdown is
     // displayable before the first `c:time:ping` round trip completes.

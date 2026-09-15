@@ -9,6 +9,7 @@ import { errors } from '@/utils/errors';
 import { generateUniqueRoomCode, normalizeRoomCode } from '@/utils/generateRoomCode';
 import { logger } from '@/utils/logger';
 import { timerService } from '@/services/timer.service';
+import { voiceService } from '@/services/voice.service';
 
 /**
  * Rooms: the live registry, membership and moderation.
@@ -131,6 +132,7 @@ export class RoomService {
       round: null,
       board: { strokes: [], redoStack: [] },
       voteKick: null,
+      voice: { members: new Map() },
       timers: new Map(),
       emptySince: Date.now(),
       closed: false,
@@ -181,6 +183,7 @@ export class RoomService {
       round: null,
       board: { strokes: [], redoStack: [] },
       voteKick: null,
+      voice: { members: new Map() },
       timers: new Map(),
       emptySince: Date.now(),
       closed: false,
@@ -215,12 +218,46 @@ export class RoomService {
     return room;
   }
 
+  /**
+   * The live room for a code, hydrating it from storage when necessary.
+   *
+   * ## Why the join path needs this
+   *
+   * `getByCode` only knows about rooms *this process* created. That is the
+   * right answer almost always — the realtime process owns the registry and
+   * every room is born in it — but there are two cases where a perfectly live
+   * room is not in the map: it outlived a restart, or it was created by the
+   * REST process in a split deployment (Quick Play does exactly that when it
+   * cannot reach a registry). In both, the room exists in Mongo, its code is
+   * still reserved, and refusing the join with `ROOM_NOT_FOUND` would be
+   * wrong.
+   *
+   * So a miss falls through to storage. A room that is genuinely unknown or
+   * closed still resolves to null and still produces the same refusal, so
+   * nothing that worked before behaves differently: this only adds an answer
+   * where the old one was "no" by accident.
+   */
+  async resolveByCode(code: string): Promise<RuntimeRoom | null> {
+    const live = this.getByCode(code);
+    if (live) return live;
+
+    const stored = await roomRepository.findLiveByCode(normalizeRoomCode(code));
+    if (!stored || stored.closedAt) return null;
+
+    return this.hydrate(String(stored._id));
+  }
+
   /** Closes a room, cancels its timers and drops it from the registry. */
   async close(room: RuntimeRoom, reason: string): Promise<void> {
     if (room.closed) return;
 
     room.closed = true;
     timerService.cancelAll(room);
+
+    // Nobody is left to broadcast to, so `reconcile` will never run again for
+    // this room. Dropping the voice group here is what stops a closed room's
+    // members holding peer connections to each other after the room is gone.
+    voiceService.clear(room);
 
     registry.byId.delete(room.roomId);
     registry.byCode.delete(room.code);

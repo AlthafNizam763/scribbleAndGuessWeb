@@ -30,6 +30,14 @@ export const ErrorCode = {
   INVALID_ROOM_CODE: 'INVALID_ROOM_CODE',
   NAME_TAKEN: 'NAME_TAKEN',
   INVALID_ACTION: 'INVALID_ACTION',
+  /**
+   * The caller is the current drawer and asked for something in the voice
+   * protocol. Spelled out as its own code rather than folded into
+   * `NOT_DRAWER` — which means the opposite — because it is the one refusal
+   * the voice feature exists to make, and a client (or a security test) has to
+   * be able to tell it apart from "you are not allowed to draw".
+   */
+  DRAWER_VOICE_DISABLED: 'DRAWER_VOICE_DISABLED',
 } as const;
 
 export type ErrorCodeName = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -58,7 +66,8 @@ export type WireErrorCode =
   | 'notDrawer'
   | 'invalidAction'
   | 'validation'
-  | 'storage';
+  | 'storage'
+  | 'drawerVoiceDisabled';
 
 interface CodeSpec {
   /** HTTP status this code answers with. */
@@ -94,6 +103,11 @@ const SPECS: Record<ErrorCodeName, CodeSpec> = {
   INVALID_ROOM_CODE: { status: 422, wire: 'invalidCode', message: 'That room code is not valid.' },
   NAME_TAKEN: { status: 409, wire: 'nameTaken', message: 'That name is already taken.' },
   INVALID_ACTION: { status: 409, wire: 'invalidAction', message: 'You cannot do that right now.' },
+  DRAWER_VOICE_DISABLED: {
+    status: 403,
+    wire: 'drawerVoiceDisabled',
+    message: 'Voice chat is off while you are drawing.',
+  },
 };
 
 /** The shape of the `error` object in both REST bodies and socket acks. */
@@ -182,4 +196,6 @@ export const errors = {
   notFound: (message?: string) => new AppError(ErrorCode.NOT_FOUND, message),
   invalidCode: (message?: string) => new AppError(ErrorCode.INVALID_ROOM_CODE, message),
   invalidAction: (message?: string) => new AppError(ErrorCode.INVALID_ACTION, message),
+  drawerVoiceDisabled: (message?: string) =>
+    new AppError(ErrorCode.DRAWER_VOICE_DISABLED, message),
 };

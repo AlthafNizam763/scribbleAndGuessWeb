@@ -1,6 +1,9 @@
 import { connectToDatabase, disconnectFromDatabase } from '@/config/database';
 import { env } from '@/config/env';
+import { Block } from '@/models/Block';
 import { ChatMessage } from '@/models/ChatMessage';
+import { FriendRequest } from '@/models/FriendRequest';
+import { Friendship } from '@/models/Friendship';
 import { Game } from '@/models/Game';
 import { Report } from '@/models/Report';
 import { Room } from '@/models/Room';
@@ -45,12 +48,33 @@ interface SyncableModel {
 
 const asSyncable = (model: unknown): SyncableModel => model as SyncableModel;
 
-const MODELS: SyncableModel[] = [User, Room, Game, Round, Word, ChatMessage, Report].map(
+const MODELS: SyncableModel[] = [
+  User,
+  Room,
+  Game,
+  Round,
+  Word,
+  ChatMessage,
+  Report,
+  FriendRequest,
+  Friendship,
+  Block,
+].map(
   asSyncable,
 );
 
 /** Collections holding play data. `words` is seeded reference data, not play. */
-const PLAY_DATA: SyncableModel[] = [User, Room, Game, Round, ChatMessage, Report].map(
+const PLAY_DATA: SyncableModel[] = [
+  User,
+  Room,
+  Game,
+  Round,
+  ChatMessage,
+  Report,
+  FriendRequest,
+  Friendship,
+  Block,
+].map(
   asSyncable,
 );
 

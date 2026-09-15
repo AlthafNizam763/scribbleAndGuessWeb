@@ -54,6 +54,59 @@ export const RATE_LIMITS = {
   moderation: { burst: 10, perSecond: 1 },
   /** The whole-stroke lifecycle, generous enough for a live pen. */
   drawing: { burst: 120, perSecond: 60 },
+  /**
+   * Joining, leaving and muting voice. Roughly one join per turn plus however
+   * often somebody taps the microphone button, so the sustained rate is low
+   * and the burst absorbs a reconnect storm.
+   */
+  voice: { burst: 12, perSecond: 1 },
+  /**
+   * Offers, answers and ICE candidates.
+   *
+   * Sized for the mesh rather than for one connection: five guessers means
+   * four peers, and each peer costs an offer or answer plus a dozen or so
+   * candidates, all of them arriving in the same second or two as a turn
+   * opens. Too tight a limit here does not throttle abuse, it drops the
+   * candidate that would have completed a call.
+   */
+  voiceSignal: { burst: 200, perSecond: 25 },
+  /**
+   * Sending a friend request.
+   *
+   * The tightest limit in this table after account creation, because it is the
+   * one action here that puts a notification in a stranger's list. A burst of
+   * five covers adding the people you just played a match with; the sustained
+   * rate of one every twenty seconds makes spraying requests across the user
+   * table pointless.
+   */
+  friendRequest: { burst: 5, perSecond: 0.05 },
+  /**
+   * Accepting, rejecting, cancelling, unfriending, blocking, unblocking.
+   *
+   * Looser than sending: these all act on a relationship that already exists,
+   * so the worst a burst does is churn the caller's own lists. Sized to let
+   * somebody clear a backlog of requests in one sitting.
+   */
+  friendAction: { burst: 20, perSecond: 1 },
+  /**
+   * User search.
+   *
+   * The expensive read in this feature — an anchored case-insensitive regex
+   * cannot seek in the index — so it is limited per caller even though it is
+   * also hard-capped at twenty-five results. The burst absorbs type-ahead:
+   * a client searching on every keystroke spends one token per character of
+   * a name, which is what the ten-token bucket is sized for.
+   */
+  userSearch: { burst: 10, perSecond: 2 },
+  /**
+   * Quick Play.
+   *
+   * Low on purpose: each call can create a room, which is the same cost as
+   * `createRoom` and is limited to match. The per-user in-flight gate in
+   * `matchmaking.service.ts` handles the double-tap case; this handles the
+   * client stuck in a retry loop.
+   */
+  quickPlay: { burst: 5, perSecond: 0.2 },
   /** Anything else with an ack. */
   action: { burst: 20, perSecond: 5 },
 } as const satisfies Record<string, RateLimitRule>;

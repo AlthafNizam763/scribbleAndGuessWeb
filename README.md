@@ -33,6 +33,7 @@ safe and how to deploy it.
 - [Architecture](#architecture)
 - [REST API](#rest-api)
 - [Socket.IO protocol](#socketio-protocol)
+- [Voice chat](#voice-chat)
 - [Game rules](#game-rules)
 - [Security model](#security-model)
 - [Testing](#testing)
@@ -114,6 +115,10 @@ with `HOST=0.0.0.0` in the backend's `.env.local`.
 | `SOCKET_URL` | no | `http://localhost:3000` | The realtime origin. Advertised to clients, and probed by `/api/health` when the two halves are deployed separately |
 | `CORS_ORIGIN` | no | `*` | Comma-separated, or `*`. Only gates browsers — native clients send no `Origin` |
 | `LOG_LEVEL` | no | `info` | `error` \| `warn` \| `info` \| `debug` |
+| `WEBRTC_STUN_URL` | no | `stun:stun.l.google.com:19302` | Voice chat. Comma-separated list accepted. Free, and enough on its own for most networks |
+| `WEBRTC_TURN_URL` | no | — | Optional relay fallback (Coturn). **Not free** — all audio passes through it |
+| `WEBRTC_TURN_USERNAME` | no | — | Never commit. Handed to clients over `s:voice:state` |
+| `WEBRTC_TURN_CREDENTIAL` | no | — | Never commit |
 
 Startup fails loudly on a missing or malformed value rather than surfacing it
 as a confusing error on the first request.
@@ -159,6 +164,42 @@ different copies and every REST-triggered broadcast would silently go nowhere.
 
 A restart drops in-flight rounds; rooms are rebuilt from Mongo when a player
 reconnects, and land back in the lobby.
+
+### Collections
+
+| Collection | Holds | Notable indexes |
+|---|---|---|
+| `users` | Accounts, including guests. Lifetime stats and optional locality | `{email}` unique-partial · `{totalScore:-1, gamesWon:-1, _id:1}` · `{localityKey:1, totalScore:-1, gamesWon:-1, _id:1}` · `{username}` |
+| `rooms` | Durable room records, players embedded | `{roomCode}` unique-partial · `{closedAt, settings.isPrivate, status, createdAt}` |
+| `games` · `rounds` | Finished matches and turns | |
+| `words` | Seeded reference data | |
+| `chatmessages` · `reports` | Transcripts, write-only reports | |
+| `friend_requests` | One row per request, kept after it resolves | `{pairKey}` unique-partial on `pending` · `{receiverId, status, createdAt}` · `{senderId, status, createdAt}` |
+| `friendships` | **One row per pair**, ids stored sorted | `{userAId, userBId}` unique · one per field for the `$or` |
+| `blocks` | Directional: belongs to the blocker | `{blockerId, blockedUserId}` unique · `{blockedUserId}` |
+
+Two shapes are worth the note:
+
+**A friendship is one row, not two.** The obvious two-row shape — `(a→b)` and
+`(b→a)` — is also the one that cannot be made correct: it can be half-written,
+duplicates are only preventable per direction, and every removal has to find
+both rows or leave a friendship that exists for one person and not the other.
+Storing the pair once with sorted ids makes the unique index the whole
+duplicate story and makes removal a single `deleteOne`. The cost is that a
+friend list is an `$or` over two fields, which the two indexes serve.
+
+**A block is deliberately *not* a sorted pair.** It belongs to whoever made it:
+they can lift it, the other party cannot see it, and both directions can exist
+independently.
+
+The leaderboard indexes carry `_id` as their last key on purpose. Without it
+Mongo walks the index for the first two fields and then sorts the ties in
+memory — slower, and an outright error past the 32MB sort limit on a large
+board.
+
+Run `npm run sync-indexes` after pulling these models. Mongoose creates missing
+indexes but never *changes* an existing one, so a leaderboard index built from
+the older two-key definition would stay two-key.
 
 ---
 
@@ -290,6 +331,152 @@ Public (auth optional). Ranked by lifetime score, ties broken by wins then id
 so the order is stable between requests. A signed-in caller also gets their own
 rank as `self`.
 
+Kept at its original path and in its original response shape so anything
+already reading it keeps working. It is the world board underneath; new
+clients should call `/world` below and get the richer envelope.
+
+### `GET /api/leaderboard/world` · `/friends` · `/locality`
+
+The three scoped boards. `?page=` and `?limit=` on all of them; `limit` is
+clamped to 100 and `page` is refused past 400, because a skip is `O(skip)` in
+Mongo and an uncapped page number is a way to make the server do arbitrary
+work for one request.
+
+| Scope | Auth | Population |
+|---|---|---|
+| `world` | optional | Everyone with `gamesPlayed > 0` |
+| `friends` | **required** | The caller plus their accepted friends, including anyone on zero games |
+| `locality` | **required** | Everyone sharing the caller's `localityKey` |
+
+```jsonc
+{
+  "success": true,
+  "data": {
+    "scope": "world",
+    "items": [ /* rank, card, stats, winRate, isSelf, rankChange */ ],
+    "currentUserRank": 4212,      // absolute, even when far off this page
+    "currentUserEntry": { /* … */ },
+    "total": 51834,
+    "page": 1,
+    "limit": 25,
+    "hasMore": true
+  }
+}
+```
+
+Ranking is `totalScore` desc, `gamesWon` desc, `_id` asc, and it is **derived
+on every read** — a stored rank would be stale for every player but one the
+moment anybody finished a game. The `_id` key is what makes the order total, so
+equal rows do not reshuffle between requests.
+
+`rankChange` is always `null` today: nothing records what anybody's rank *was*,
+and an arrow drawn from no history would be invented. The field is on the wire
+so adding a snapshot job later needs no new client build.
+
+The locality board groups by a normalised `country|region|city` key. A caller
+with no city set gets an empty page and `locality: null`, which the app renders
+as a prompt to finish their profile rather than as an error.
+
+### `GET /api/leaderboard/me/rank?scope=world|friends|locality`
+
+The caller's standing without a page of rows, so a client can show "you are
+4,212nd" without paging to find them. `rank` is `null` for a player who has
+never finished a game.
+
+### `POST /api/rooms/quick-play`
+
+Finds a public room with a free seat and seats the caller, opening one when
+nothing suitable is waiting. **Takes no parameters** — the point of the button
+is that there is nothing to decide.
+
+Never matches a private room, a full one, a game already in progress, one the
+caller is banned from, or one holding somebody a block stands between. Ranks
+candidates by how full they are (closest to starting first), ties broken by
+age, so a burst of simultaneous taps converges on one room.
+
+There is no second engine here: matchmaking picks a room and
+`roomService.joinRoom` seats the player, exactly as the room-code path does.
+
+```jsonc
+{
+  "success": true,
+  "data": {
+    "room": { /* … */ },
+    "roomCode": "A7K9P",
+    "created": false,       // a room had to be opened
+    "alreadySeated": false, // the caller was already in this room
+    "joined": true          // see below
+  }
+}
+```
+
+`joined` says whether the caller was actually seated. In the single-process
+deployment it is always `true`. In the split deployment this process has no
+live room registry to seat anybody in, so it names a room out of Mongo and
+answers `joined: false`; the client then joins it over the socket, which is
+where the authoritative checks run anyway. **The Flutter client uses
+`c:room:quickPlay` instead** and is always seated in one round trip.
+
+### `GET /api/users/search?q=&limit=`
+
+Players whose name starts with `q`. Rate limited per caller, hard-capped at 25
+results, and excludes the caller plus everyone a block stands between — a
+blocked user is simply absent from the world rather than visibly hidden. Each
+result carries its `relation`, so a list draws the right button per row without
+a request per row.
+
+### `GET /api/users/:userId/profile`
+
+Another player's public card, stats, world rank, and the caller's `relation` to
+them — the single value the app's profile button is drawn from. Computed
+server-side so a stale client cannot offer an action the server would refuse.
+
+A caller who has been blocked sees a profile identical to a stranger's
+(`relation: "none"`), and their Add Friend tap is refused with a message that
+does not say why.
+
+### `PATCH /api/users/me/locality`
+
+`{city, region, country}` — a two-letter ISO country code. Separate from
+`PATCH /api/users/me` because the set of fields an endpoint can write is the
+security boundary: a body aimed at renaming somebody must not also relocate
+them. There is no field here, on the endpoint, or on the user document for a
+street, a postcode or a coordinate.
+
+### Friends
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/friends/requests` | Body names the receiver only; the sender is the token |
+| `GET` | `/api/friends/requests/incoming` | Who is waiting on you |
+| `GET` | `/api/friends/requests/outgoing` | Who you are waiting on |
+| `POST` | `/api/friends/requests/:id/accept` | Receiver only |
+| `POST` | `/api/friends/requests/:id/reject` | Receiver only |
+| `POST` | `/api/friends/requests/:id/cancel` | Sender only |
+| `GET` | `/api/friends` | Accepted friends |
+| `DELETE` | `/api/friends/:userId` | Ends the friendship for both at once |
+
+A request id is **not a capability**: the caller's right to act is checked
+against the loaded row, so guessing one gets `NOT_ROOM_MEMBER` rather than
+somebody else's friendship.
+
+Refused: adding yourself, a duplicate pending request **in either direction**,
+adding somebody a block stands between, accepting into a block placed after the
+request was sent, and acting on a request that has already been handled.
+
+### Blocks
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/blocks/:userId` | Ends the friendship, cancels pending requests both ways |
+| `DELETE` | `/api/blocks/:userId` | Lifts the block; restores nothing |
+| `GET` | `/api/blocks` | The caller's own list only |
+
+There is deliberately no "who has blocked me" endpoint, and no event tells a
+blocked user they were blocked. Unblocking does **not** restore the friendship
+it destroyed — quietly resurrecting something somebody deliberately ended would
+be the opposite of what they asked for.
+
 ### `GET /api/health`
 
 Unauthenticated, so a load balancer probe works. Returns **503** when the
@@ -382,6 +569,7 @@ use the app's `AppErrorCode` vocabulary (`roomFull`, `notHost`, `notDrawer`,
 | `c:time:ping` | `{t0}` | Acks `{t0, t1}` — **no** `ok` envelope |
 | `c:room:create` | `{settings}` | Acks `{room}` |
 | `c:room:join` | `{code}` | Acks `{room}` |
+| `c:room:quickPlay` | `{profile}` | Acks `{room, created, alreadySeated}`. Matchmakes and seats in one round trip |
 | `c:room:leave` | `{}` | |
 | `c:room:ready` | `{ready}` | |
 | `c:room:settings` | `{settings}` | Host only |
@@ -399,6 +587,12 @@ use the app's `AppErrorCode` vocabulary (`roomFull`, `notHost`, `notDrawer`,
 | `c:draw:end` | `{strokeId}` | **No ack.** Drawer only |
 | `c:draw:undo` / `redo` / `clear` | `{}` | **No ack.** Drawer only |
 | `c:chat:send` | `{text}` | Acks `{verdict}`: `correct` \| `close` \| `wrong` |
+| `c:voice:join` | `{}` | Acks the caller's voice state. **Refused for the drawer** |
+| `c:voice:leave` | `{}` | Always allowed, drawer included |
+| `c:voice:offer` | `{targetId, description}` | Guesser → guesser only |
+| `c:voice:answer` | `{targetId, description}` | Guesser → guesser only |
+| `c:voice:ice` | `{targetId, candidate}` | Guesser → guesser only |
+| `c:voice:mute` | `{muted}` | Advisory; the track is disabled on the sender's device |
 
 ### Server → client
 
@@ -418,6 +612,41 @@ use the app's `AppErrorCode` vocabulary (`roomFull`, `notHost`, `notDrawer`,
 | `s:chat:message` | `{message}` |
 | `s:time:sync` | `{serverTimeMs}` |
 | `s:error` | `{error}` |
+| `s:voice:state` | `{enabled, isDrawer, phase, muted, peers, iceServers}` — **per recipient** |
+| `s:voice:peerJoined` | `{peer}` — voice group only, so never the drawer |
+| `s:voice:peerLeft` | `{userId, reason}` — voice group only |
+| `s:voice:offer` / `answer` / `ice` | `{from, description \| candidate}` — to one peer's socket |
+| `s:voice:mute` | `{userId, muted}` — voice group only |
+| `s:voice:error` | `{code, message}` — e.g. `DRAWER_VOICE_DISABLED` |
+| `s:friend:requestReceived` | `{requestId, user}` — to the receiver |
+| `s:friend:requestAccepted` | `{requestId, user}` — to the original sender |
+| `s:friend:requestRejected` | `{requestId, user}` — to the original sender |
+| `s:friend:requestCancelled` | `{requestId}` — to the receiver |
+| `s:friend:removed` | `{user}` — to the other party |
+| `s:friend:blocked` / `unblocked` | `{user}` — **to the blocker only** |
+
+### Friend events
+
+Addressed to a *player* rather than a room: they go out on `userChannel`, so
+they arrive on every device that person is signed in on and whether or not they
+are in a game.
+
+Each is emitted twice — once as `s:friend:*` above, once under the flatter
+`friend:request_received` / `friend:removed` spelling. Same payload, same
+channel, so a client written against either vocabulary works and neither has to
+be migrated. A client listens for one set or the other, never both.
+
+They carry a public card and an id, and nothing else. **They are a nudge to
+refresh, not a transport**: the authoritative lists come from REST, and the
+Flutter client folds every one of these into a re-read rather than parsing list
+entries out of them. Missing one therefore costs a refresh and nothing more,
+which matters because the realtime server may be deployed separately and may be
+restarting.
+
+Note what is absent: nothing is sent to the person who was *blocked*, because
+being told would be exactly the disclosure the feature avoids. The one thing
+they can observe is a friendship that quietly ended — unavoidable, since the
+friend is simply not in their list any more.
 
 ### Drawing payloads
 
@@ -434,6 +663,91 @@ on a tablet lands in the same place on a phone. The server clamps them rather
 than rejecting — a value a hair outside the box is a rounding artefact, and
 dropping the batch would make lines stutter at the edge. The author is always
 overwritten from the authenticated socket.
+
+---
+
+## Voice chat
+
+Guessers talk to each other over WebRTC while somebody draws. The drawer can
+neither speak nor hear.
+
+### What this server carries
+
+Signalling, and nothing else: SDP offers, SDP answers and ICE candidates. The
+audio is a peer-to-peer stream between players' devices that never reaches this
+process, never travels over Socket.IO and is never written to MongoDB. A room
+of six costs the server a few dozen small messages per turn.
+
+That is what makes the feature free to run, and it is why it needs no media
+server, no SFU and no paid SDK.
+
+### The rule, and where it is enforced
+
+```
+Round 1 — A draws            Round 2 — B draws
+  B ↔ C   B ↔ D   C ↔ D        A ↔ C   A ↔ D   C ↔ D
+  A: no connections            B: no connections
+```
+
+The drawer is not merely hidden from the UI. They are never admitted to the
+voice group, no peer is ever handed their id, and every `c:voice:*` frame from
+or to them is refused:
+
+```jsonc
+{ "ok": false,
+  "error": { "code": "notDrawer",
+             "message": "Voice chat is off while you are drawing.",
+             "details": { "code": "DRAWER_VOICE_DISABLED" } } }
+```
+
+`voice.service.ts` checks all of it against state this process owns: the caller
+is in the room, is connected, is **not** `room.round.drawerId`, the phase is one
+where voice is open, and — for signalling — the target is in the room, in the
+voice group, and not the drawer either.
+
+`c:voice:leave` is the deliberate exception and is always allowed. A client
+that has just been made drawer calls it to comply, and refusing that would
+strand a well-behaved client holding a connection it was told to drop.
+
+The voice fan-out uses its own Socket.IO channel (`voice:<roomId>`) rather than
+the room channel, so "the drawer cannot hear anybody" holds at the transport
+level and not only in the handlers.
+
+### How membership stays correct
+
+`gameService.broadcastState` calls `voiceService.reconcile`, and that is the
+only hook. Every state change already funnels through that broadcast — a turn
+opening, the pen changing hands, a pause, a resume, a departure, a reconnect —
+so there is no list of call sites that each have to remember to hang the old
+drawer up. `reconcile` re-derives who belongs in voice, evicts anybody who does
+not, and pushes `s:voice:state` to the evicted socket directly. It returns
+immediately for a room with an empty voice group, which is every room outside a
+turn.
+
+Voice is open during `word_selection`, `drawing` and `round_result`, and closed
+in the lobby, the starting countdown, a paused match and the final scoreboard.
+
+### Mesh, not mixer
+
+Rooms are small, so every guesser holds one peer connection to every other
+guesser. At six players that is five connections per device, which a phone
+handles comfortably. Who offers in a pair is settled by comparing player ids —
+the lexicographically smaller one offers — so both ends reach the same answer
+with no extra round trip, and neither glare nor a duplicate connection is
+possible.
+
+### STUN and TURN
+
+`iceServers` is built from the `WEBRTC_*` environment and handed to clients
+over `s:voice:state`. Nothing about STUN or TURN is compiled into the app,
+which is what keeps a relay credential out of every installed APK and lets one
+be rotated by restarting this process.
+
+STUN alone is the default and is enough for the large majority of home and
+mobile networks. TURN is the fallback for peers behind a symmetric NAT: it is
+optional, it is not free — every byte of audio is relayed — and with none
+configured such a pair simply fails to connect while the rest of the mesh
+carries on.
 
 ---
 
@@ -534,13 +848,55 @@ won, who hosts, permissions, or round status. Concretely:
   whole team can read is a cheating vector.
 - Reports are write-only. No endpoint reads them back.
 
+### Friends, blocks and leaderboards
+
+Same rule, applied to the social features: the client is never trusted for
+score, rank, locality, friendship status or block status.
+
+- **The only id a caller ever supplies about another player is that player's
+  id.** No endpoint accepts a `senderId`, an owner, a relation or a score — the
+  actor is always the token. A body that spells `senderId` has the key stripped
+  by Zod and changes nothing.
+- **A request id is not a capability.** Accept, reject and cancel each check
+  the caller against the loaded row, so guessing an id gets a refusal rather
+  than somebody else's friendship.
+- **Duplicate prevention is an index, not a check.** A partial unique index on
+  the sorted `pairKey` lets exactly one pending request exist between two
+  people in *either* direction. The service reads first to produce a good
+  message, but the index is what makes the rule true when two people tap "Add
+  friend" on each other in the same instant.
+- **Resolving a request is a conditional update.** `{_id, status: pending}` in
+  the filter means a double-tap, or an accept racing a cancel, matches once;
+  the loser is told the request was already handled rather than performing the
+  action twice.
+- **Blocking is written before it cascades**, so every gate is already refusing
+  before the friendship is torn down. A block placed *after* a request was sent
+  still wins: accepting into one is refused and the request is cancelled.
+- **Locality cannot hold an address.** The schema has fields for a city, a
+  region and a two-letter country code and nothing else — the same structural
+  refusal `updateProfile` makes for scores. A write that cannot be expressed
+  cannot be made.
+- **Blocked users are excluded from search, leaderboards and matchmaking**, and
+  the block is never disclosed to the person it was placed on: their view of a
+  profile is identical to a stranger's.
+- Paging is bounded at both ends (`limit` ≤ 100, `page` ≤ 400) so an
+  unbounded skip cannot be used to make the server do arbitrary work.
+- Sending a friend request and searching users have their own rate-limit
+  buckets — the first because it puts a notification in a stranger's list, the
+  second because an anchored case-insensitive match cannot seek in the index.
+
+**Leaderboard scores come only from finished games.** Nothing in the
+leaderboard path writes; every number it reads was put on a user row by
+`recordGameResult`, which only the end-of-match path calls.
+
 ---
 
 ## Testing
 
 ```bash
-npm test          # 85 unit tests, no database required
-npm run test:e2e  # 46 checks, three real clients, needs a running server
+npm test                # unit tests, no database required
+npm run test:e2e        # the full game, three real clients, needs a running server
+npm run test:e2e:voice  # 37 voice checks, three real clients, needs a running server
 
 # 26 checks against a *split* deployment: REST on one origin, realtime on
 # another. Defaults to the Vercel API plus a local realtime server.
@@ -554,12 +910,61 @@ one-letter near misses, non-Latin scripts), the hint engine (never more than
 half, idempotent, spaces free), room codes, settings clamping, the timer and
 the drawing board.
 
+`tests/matchmaking.test.ts` covers Quick Play eligibility and ordering as pure
+functions of a room and a user: private, full, in-progress, finishing, closed,
+banned, already-seated and blocked rooms are each rejected by name, a paused
+room is accepted (it is waiting for exactly that player), and ranking prefers
+the fullest room with ties broken by age so the order is deterministic.
+
+`tests/social.test.ts` covers the friend and leaderboard rules that need no
+database: pair normalisation producing one key from either direction and never
+colliding across pairs, locality keys folding case and punctuation while
+keeping same-named towns in different countries apart, win-rate arithmetic,
+rank-change staying `null` without history, paging clamped at one end and
+refused at the other, and the validators — including that the send-request body
+has no field for a sender and the locality body has none for an address.
+
+What is *not* simulated: the partial unique index that refuses a mirrored
+pending request, and the `status: pending` guard that makes a double Accept a
+no-op. Both are enforced by MongoDB, and a test that faked them would be a test
+of the fake. Exercise them against a real database:
+
+```bash
+npm run sync-indexes    # required once after pulling these models
+
+# Two accounts, A and B. With A's token:
+curl -XPOST $API/api/friends/requests -d '{"receiverId":"<B>"}'   # 201
+# Now with B's token — the mirrored request:
+curl -XPOST $API/api/friends/requests -d '{"receiverId":"<A>"}'   # 409 INVALID_ACTION
+# And accept it twice from B:
+curl -XPOST $API/api/friends/requests/<id>/accept                 # 200
+curl -XPOST $API/api/friends/requests/<id>/accept                 # 409, not a second friendship
+```
+
 `npm run test:e2e` walks the brief's Definition of Done with three
 authenticated clients over a real websocket: guest login → create → join by
 code → ready → start → server picks the drawer → drawer gets words → **other
 players do not** → drawing relays → non-drawer refused → guessing → scoring →
 duplicate guess refused → timer ends → answer revealed → next drawer → final
 result → play again.
+
+`npm run test:e2e:voice` is the security test for voice chat, run the way an
+attacker would. It emits `voice:join`, `voice:offer`, `voice:answer` and
+`voice:ice_candidate` straight from the drawer's socket — under both the
+canonical `c:voice:*` names and the shorter aliases — and checks every one
+comes back `DRAWER_VOICE_DISABLED`. Then the positive half: two guessers join,
+exchange an offer, an answer and a candidate, and see each other's mute state,
+while the drawer's socket receives no voice traffic at all. Finally it waits for
+the turn to end and checks that the pen moving flips both players' permission —
+the previous drawer may speak, the new one may not.
+
+It accepts `API_URL` and `SOCKET_URL` separately, so it can be pointed at a
+locally rebuilt realtime server while another process keeps serving REST.
+
+Voice *audio* is not covered by any automated test, and cannot be: hearing
+somebody needs two real devices. The manual matrix is three clients with one
+drawing — check the drawer hears nobody and nobody hears the drawer, then mute,
+unmute, drop one client's network, and let the turn roll over.
 
 `tests/realtime.twoclient.mjs` is the same idea aimed at the split deployment:
 it mints its JWTs from the REST origin and presents them to a *different*

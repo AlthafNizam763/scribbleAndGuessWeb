@@ -77,6 +77,7 @@ export function makeRoom(
     round: null,
     board: { strokes: [], redoStack: [] },
     voteKick: null,
+    voice: { members: new Map() },
     timers: new Map(),
     emptySince: null,
     closed: false,

@@ -137,6 +137,37 @@ export interface RuntimeRound {
   ended: boolean;
 }
 
+/**
+ * One seat in a room's voice group (brief: guesser-only voice chat).
+ *
+ * Bound to a *socket*, not merely a user. A player signed in on two devices
+ * holds two sockets, and a mesh keyed by user id would hand both of them the
+ * same offer and build two half-connections for one person. Pinning voice to
+ * the socket that asked for it makes "who do I send this SDP to" a single
+ * answer, and a second device joining simply takes the seat over.
+ */
+export interface RuntimeVoiceMember {
+  userId: string;
+  socketId: string;
+  /** Whether their microphone track is currently disabled. */
+  muted: boolean;
+  joinedAt: number;
+}
+
+/**
+ * The room's voice group.
+ *
+ * Membership only — no audio, no SDP and no candidates are ever kept here.
+ * The server is a signalling relay: offers, answers and ICE candidates pass
+ * through it and are forgotten, and the audio itself never touches this
+ * process at all (it goes peer to peer over WebRTC, or via TURN when a NAT
+ * forbids that).
+ */
+export interface RuntimeVoice {
+  /** Current voice members, keyed by user id. Never contains the drawer. */
+  members: Map<string, RuntimeVoiceMember>;
+}
+
 /** A live room: the single source of truth while the process is up. */
 export interface RuntimeRoom {
   roomId: string;
@@ -163,6 +194,8 @@ export interface RuntimeRoom {
   round: RuntimeRound | null;
   board: RuntimeBoard;
   voteKick: RuntimeVoteKick | null;
+  /** Who is in voice right now. Rebuilt from scratch by every turn. */
+  voice: RuntimeVoice;
 
   /** Handles for every timer this room owns, so they can all be cancelled. */
   timers: Map<string, NodeJS.Timeout>;

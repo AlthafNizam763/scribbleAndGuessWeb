@@ -1,6 +1,7 @@
 import { Schema, model, models, type InferSchemaType, type Model } from 'mongoose';
 
 import { INPUT_LIMITS } from '@/constants/game.constants';
+import { LOCALITY_LIMITS } from '@/constants/social.constants';
 
 /**
  * A player account (brief section 5).
@@ -71,6 +72,44 @@ const userSchema = new Schema(
     gamesWon: { type: Number, default: 0, min: 0 },
     totalScore: { type: Number, default: 0, min: 0 },
     bestRoundScore: { type: Number, default: 0, min: 0 },
+
+    /**
+     * Where the player plays from, for the locality leaderboard.
+     *
+     * ## Why these three fields and no more
+     *
+     * A locality board only needs to answer "who else is near me", and a town
+     * name answers it. A street address, a postcode or a coordinate pair would
+     * answer a different and far more dangerous question, so none of them is a
+     * field here: there is no schema path by which an address could be stored,
+     * whatever a client sends. This is the same argument as the stats above —
+     * a write that cannot be expressed cannot be made.
+     *
+     * Every field is optional. A player who never fills them in simply has no
+     * locality board, which is the empty state the client renders.
+     */
+    city: { type: String, trim: true, maxlength: LOCALITY_LIMITS.maxCityLength, default: null },
+    region: { type: String, trim: true, maxlength: LOCALITY_LIMITS.maxRegionLength, default: null },
+    /** ISO 3166-1 alpha-2, upper case. */
+    country: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      maxlength: LOCALITY_LIMITS.countryLength,
+      default: null,
+    },
+
+    /**
+     * The grouping key for the locality board, derived from the fields above.
+     *
+     * Written by `userRepository.updateLocality` and never accepted from a
+     * caller. It exists because "same locality" has to be an equality match on
+     * one indexed field: comparing `city` and `country` separately would mean
+     * a compound index whose leading field is low-cardinality, and comparing
+     * display strings directly would put `Kochi` and `kochi ` in different
+     * towns.
+     */
+    localityKey: { type: String, default: null },
   },
   {
     timestamps: true,
@@ -96,8 +135,41 @@ userSchema.index(
   { unique: true, partialFilterExpression: { email: { $type: 'string' } } },
 );
 
-// Serves the leaderboard's default ordering directly from the index.
-userSchema.index({ totalScore: -1, gamesWon: -1 });
+/**
+ * The world leaderboard's ordering, served straight from the index.
+ *
+ * All three keys, in the order the query sorts by. `_id` is the tie-break that
+ * makes the ranking stable between requests, and it has to be *in* the index:
+ * with only the first two keys Mongo can walk the index for the first two
+ * fields but must then sort the ties in memory, which is both slower and, past
+ * the 32MB sort limit, an outright error on a large board.
+ *
+ * It is also what makes `countDocuments({gamesPlayed: {$gt: 0}})` and the
+ * "how many players are above me" rank query index-only.
+ */
+userSchema.index({ totalScore: -1, gamesWon: -1, _id: 1 });
+
+/**
+ * The same ordering, scoped to one town.
+ *
+ * `localityKey` leads because it is the equality predicate; the sort keys
+ * follow. This is the shape an index has to have to serve equality-then-sort
+ * without a blocking sort stage.
+ */
+userSchema.index({ localityKey: 1, totalScore: -1, gamesWon: -1, _id: 1 });
+
+/**
+ * User search.
+ *
+ * Search is an anchored, case-insensitive regex over this field. An anchored
+ * regex with the `i` flag cannot *seek* in the index the way a case-sensitive
+ * one can, so this is an index scan rather than a range scan — but it stays
+ * inside the index instead of touching documents, and every search endpoint
+ * is both hard-limited and rate-limited. The alternative, a denormalised
+ * lower-case column, would need a backfill for every account that already
+ * exists and would go stale on any write that forgot it.
+ */
+userSchema.index({ username: 1 });
 
 // Lets the sweeper find stale guest accounts without a collection scan.
 userSchema.index({ lastSeenAt: -1 });

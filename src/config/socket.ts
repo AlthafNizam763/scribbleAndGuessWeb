@@ -3,7 +3,7 @@ import type { Server as HttpServer } from 'node:http';
 import { Server } from 'socket.io';
 
 import { env } from '@/config/env';
-import { roomChannel, userChannel } from '@/constants/socket.constants';
+import { roomChannel, userChannel, voiceChannel } from '@/constants/socket.constants';
 import type { GameServer, GameSocket } from '@/types/socket.types';
 import { logger } from '@/utils/logger';
 
@@ -104,6 +104,29 @@ export function emitToRoomExcept(
   payload: unknown,
 ): void {
   socket.to(roomChannel(roomId)).emit(event, payload);
+}
+
+/**
+ * Emits to one specific socket.
+ *
+ * Voice chat is the reason this exists. Its mesh is keyed by socket rather
+ * than by user — a player signed in twice holds two sockets, and delivering
+ * one SDP offer to both would build two half-connections for one person — so
+ * signalling has to be addressable at exactly the connection that joined.
+ */
+export function emitToSocket(socketId: string, event: string, payload: unknown): void {
+  instance()?.to(socketId).emit(event, payload);
+}
+
+/**
+ * Emits to a room's voice group.
+ *
+ * Distinct from `emitToRoom` on purpose: the drawer is in the room channel and
+ * must never receive voice traffic, so this fan-out reaches only the sockets
+ * currently admitted to voice.
+ */
+export function emitToVoice(roomId: string, event: string, payload: unknown): void {
+  instance()?.to(voiceChannel(roomId)).emit(event, payload);
 }
 
 /** Emits to every socket belonging to one user, across their devices. */
