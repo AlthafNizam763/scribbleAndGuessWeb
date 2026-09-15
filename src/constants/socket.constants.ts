@@ -55,6 +55,22 @@ export const CLIENT_ROOM_TRANSFER_HOST = 'c:room:transferHost';
 export const CLIENT_ROOM_VOTE_KICK = 'c:room:voteKick';
 /** Reports a player with a free-form reason. */
 export const CLIENT_ROOM_REPORT = 'c:room:report';
+
+// --- invitations ------------------------------------------------------------
+
+/**
+ * Invites a friend to the caller's room.
+ *
+ * A socket event as well as `POST /api/rooms/:roomId/invite` because the
+ * inviter is almost always sitting in the lobby with a connection already
+ * open, and the invitee's push has to originate in the process holding the
+ * rooms. Both spellings call the same service, so the rules cannot drift.
+ */
+export const CLIENT_ROOM_INVITE = 'c:room:invite';
+/** Accepts an invitation and takes the seat, in one round trip. */
+export const CLIENT_ROOM_INVITE_ACCEPT = 'c:room:inviteAccept';
+/** Declines an invitation. */
+export const CLIENT_ROOM_INVITE_REJECT = 'c:room:inviteReject';
 /** Starts the match. Host only. */
 export const CLIENT_GAME_START = 'c:game:start';
 /** Picks one of the offered words by index. Drawer only. */
@@ -221,6 +237,76 @@ export const FRIEND_EVENTS = {
 
 export type FriendEventName = keyof typeof FRIEND_EVENTS;
 
+// --- room invitations and membership ----------------------------------------
+
+/**
+ * The invitation and membership pushes, each under two names.
+ *
+ * The same two-vocabulary arrangement as `FRIEND_EVENTS` directly above, for
+ * the same reason: `canonical` is the `s:room:*` spelling every other
+ * server-to-client event in this file uses, and `alias` is the flatter
+ * `room:*` spelling the brief names. Both go out with the same payload, so a
+ * client written against either vocabulary works and neither has to be
+ * migrated. A client listens for one or the other, never both.
+ *
+ * ## What is addressed to a person and what to a room
+ *
+ * The three invitation events reach a *user*: they go out on `userChannel`,
+ * so an invitation appears on every device that person is signed in on, and
+ * on none of the devices of anybody else. That is what makes "if the invited
+ * user is online, show it immediately" true without a poll.
+ *
+ * The three membership events reach a *room*: everybody seated learns that
+ * somebody arrived or left. They are strictly additional to `s:room:state`,
+ * which still carries the authoritative player list — these say *what
+ * changed*, the snapshot says what is. A client may render from either and
+ * must trust the snapshot where they disagree.
+ */
+export const ROOM_EVENTS = {
+  /** Somebody invited you to their room. Sent to the invitee. */
+  invitationReceived: {
+    canonical: 's:room:invitationReceived',
+    alias: 'room:invitation_received',
+  },
+  /** An invitation you sent was accepted. Sent to the inviter. */
+  invitationAccepted: {
+    canonical: 's:room:invitationAccepted',
+    alias: 'room:invitation_accepted',
+  },
+  /** An invitation you sent was declined. Sent to the inviter. */
+  invitationRejected: {
+    canonical: 's:room:invitationRejected',
+    alias: 'room:invitation_rejected',
+  },
+  /** An invitation addressed to you is no longer answerable. Sent to the invitee. */
+  invitationExpired: {
+    canonical: 's:room:invitationExpired',
+    alias: 'room:invitation_expired',
+  },
+  /** A player took a seat. Sent to the room. */
+  playerJoined: {
+    canonical: 's:room:playerJoined',
+    alias: 'room:player_joined',
+  },
+  /** A player gave up their seat. Sent to the room. */
+  playerLeft: {
+    canonical: 's:room:playerLeft',
+    alias: 'room:player_left',
+  },
+  /** The room changed in some way. Sent to the room, carrying the snapshot. */
+  updated: {
+    canonical: 's:room:updated',
+    alias: 'room:updated',
+  },
+  /** A refused room operation that was not tied to an ack. */
+  error: {
+    canonical: 's:room:error',
+    alias: 'room:error',
+  },
+} as const satisfies Record<string, { canonical: string; alias: string }>;
+
+export type RoomEventName = keyof typeof ROOM_EVENTS;
+
 /**
  * Alternate inbound names from the brief's section 16.
  *
@@ -233,6 +319,9 @@ export const ALIASES: Readonly<Record<string, string>> = Object.freeze({
   'room:join': CLIENT_ROOM_JOIN,
   'room:quick_play': CLIENT_ROOM_QUICK_PLAY,
   'room:leave': CLIENT_ROOM_LEAVE,
+  'room:invite': CLIENT_ROOM_INVITE,
+  'room:invite_accept': CLIENT_ROOM_INVITE_ACCEPT,
+  'room:invite_reject': CLIENT_ROOM_INVITE_REJECT,
   'player:ready': CLIENT_ROOM_READY,
   'game:start': CLIENT_GAME_START,
   'game:select_word': CLIENT_GAME_SELECT_WORD,
@@ -273,3 +362,49 @@ export const userChannel = (userId: string): string => `user:${userId}`;
  * the handlers.
  */
 export const voiceChannel = (roomId: string): string => `voice:${roomId}`;
+
+// --- notifications ----------------------------------------------------------
+
+/**
+ * The notification pushes, each under two names.
+ *
+ * The same two-vocabulary arrangement as `FRIEND_EVENTS` and `ROOM_EVENTS`
+ * above, and addressed the same way: to a *user* channel, so a notification
+ * lands on every device that person is signed in on.
+ *
+ * ## Why these are additional to the friend and room events, not instead of
+ *
+ * A friend request already emits `s:friend:requestReceived`, and now also
+ * writes a notification row that emits `s:notification:new`. That looks like
+ * duplication and is not: the friend event tells a *screen* its cached list is
+ * stale, and the notification event tells the *badge* its count changed. A
+ * client showing the friends screen acts on the first; a client showing the
+ * home screen acts on the second. Collapsing them would mean every badge
+ * update had to be inferred from every domain event the client happens to
+ * know about, which is exactly the fan-out the notifications collection
+ * exists to centralise.
+ *
+ * The payload is the full `NotificationDto` rather than a bare id, because the
+ * common case is rendering a toast immediately. `unreadCount` rides along so
+ * the badge never needs a second round trip.
+ */
+export const NOTIFICATION_EVENTS = {
+  /** A notification was created for you. Carries the row and the new count. */
+  created: {
+    canonical: 's:notification:new',
+    alias: 'notification:new',
+  },
+  /**
+   * Your unread count changed without a new row arriving.
+   *
+   * Emitted on read, read-all and delete, and it is what keeps a second device
+   * in step: clearing the badge on a phone must clear it on the tablet too,
+   * and neither device learns that from a `created` event.
+   */
+  unreadChanged: {
+    canonical: 's:notification:unread',
+    alias: 'notification:unread',
+  },
+} as const satisfies Record<string, { canonical: string; alias: string }>;
+
+export type NotificationEventName = keyof typeof NOTIFICATION_EVENTS;

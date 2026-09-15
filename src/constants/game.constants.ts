@@ -70,6 +70,17 @@ export const TIMING = {
   sweepIntervalMs: 30_000,
   /** How long a vote-kick poll stays open. */
   voteKickWindowMs: 30_000,
+  /**
+   * How long a room invitation stays answerable.
+   *
+   * Long enough to be seen on a phone that was face-down, short enough that
+   * the room it names is plausibly still the room described in it. Past this
+   * the invitation is refused with `Invitation expired` rather than dropping
+   * the invitee into a game that has moved on without them.
+   */
+  invitationTtlMs: 10 * 60 * 1000,
+  /** How often lapsed invitations are swept into the `expired` status. */
+  invitationSweepIntervalMs: 60_000,
 } as const;
 
 /** Minimum seated players before the host may start (brief section 18). */

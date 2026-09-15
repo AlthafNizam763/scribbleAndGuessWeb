@@ -2,6 +2,9 @@ import { emitToRoom, removeUserFromRoomChannel } from '@/config/socket';
 import {
   CLIENT_ROOM_BAN,
   CLIENT_ROOM_CREATE,
+  CLIENT_ROOM_INVITE,
+  CLIENT_ROOM_INVITE_ACCEPT,
+  CLIENT_ROOM_INVITE_REJECT,
   CLIENT_ROOM_JOIN,
   CLIENT_ROOM_KICK,
   CLIENT_ROOM_LEAVE,
@@ -15,10 +18,13 @@ import {
   SERVER_DRAW_SNAPSHOT,
   SERVER_ROOM_CLOSED,
   SERVER_VOICE_STATE,
+  ROOM_EVENTS,
   roomChannel,
 } from '@/constants/socket.constants';
 import { parsePayload } from '@/middleware/validation.middleware';
 import {
+  invitationTargetSchema,
+  inviteToRoomSchema,
   joinRoomSchema,
   muteSchema,
   playerTargetSchema,
@@ -30,6 +36,7 @@ import {
 import { chatService } from '@/services/chat.service';
 import { drawingService } from '@/services/drawing.service';
 import { gameService } from '@/services/game.service';
+import { invitationService } from '@/services/invitation.service';
 import { matchmakingService } from '@/services/matchmaking.service';
 import { moderationService } from '@/services/moderation.service';
 import { presenceService } from '@/services/presence.service';
@@ -153,7 +160,7 @@ export function registerRoomHandlers(socket: GameSocket): void {
       // symptom this sync exists to remove.
       await syncSocketProfile(sock, payload);
 
-      await leaveCurrentRoom(sock);
+      await leaveCurrentRoom(sock, room.roomId);
 
       const { rejoined } = await roomService.joinRoom({ room, user: sock.data.user });
       await enterRoom(sock, room);
@@ -196,7 +203,7 @@ export function registerRoomHandlers(socket: GameSocket): void {
       // button from inside a game. Re-enter for a fresh snapshot, but announce
       // nothing and do not leave first: they never went anywhere.
       const wasHere = sock.data.roomId === outcome.room.roomId;
-      if (!wasHere) await leaveCurrentRoom(sock);
+      if (!wasHere) await leaveCurrentRoom(sock, outcome.room.roomId);
 
       await enterRoom(sock, outcome.room);
 
@@ -248,6 +255,86 @@ export function registerRoomHandlers(socket: GameSocket): void {
       await gameService.broadcastState(room);
     },
     { limit: 'action', requiresRoom: true },
+  );
+
+  // ------------------------------------------------------------- invitations
+
+  /**
+   * Invites a friend to the room this socket is sitting in.
+   *
+   * `requiresRoom` is what makes the room implicit: an inviter is by
+   * definition somebody in a lobby, and taking the room from the connection
+   * rather than from the payload removes the only field a caller could use to
+   * invite somebody into a room they are not in. The REST endpoint has to name
+   * the room in its path and therefore re-checks membership; here the socket
+   * has already answered that question.
+   */
+  on(
+    socket,
+    CLIENT_ROOM_INVITE,
+    async ({ room, socket: sock }, payload) => {
+      const { inviteeId } = parsePayload(payload, inviteToRoomSchema);
+
+      const invitation = await invitationService.invite({
+        room,
+        inviter: sock.data.user,
+        inviteeId,
+      });
+
+      return { invitation };
+    },
+    { limit: 'roomInvite', requiresRoom: true, errorEvent: ROOM_EVENTS.error.alias },
+  );
+
+  /**
+   * Accepts an invitation and enters the room, in one round trip.
+   *
+   * The reason this exists beside the REST accept: REST can seat an *account*
+   * but not a *connection*, so a player accepting over REST is in the room
+   * without their socket being in its channel, and sees nothing until their
+   * next `c:room:join`. Here the seat and the channel are taken together, so
+   * the ack that says "you are in" is true of the socket as well.
+   *
+   * The existing room is left first, exactly as `c:room:join` does — and for
+   * the same reason: one connection, one room.
+   */
+  on(
+    socket,
+    CLIENT_ROOM_INVITE_ACCEPT,
+    async ({ socket: sock }, payload) => {
+      const { invitationId } = parsePayload(payload, invitationTargetSchema);
+
+      // Before the seat is cut, so the lobby shows the name this device is
+      // showing rather than the one the account was created with.
+      await syncSocketProfile(sock, payload);
+      await leaveCurrentRoom(sock);
+
+      const { room, rejoined } = await invitationService.accept(
+        sock.data.user,
+        invitationId,
+      );
+
+      await enterRoom(sock, room);
+
+      if (!rejoined) {
+        await chatService.presence(room, `${sock.data.user.username} joined.`, true);
+      }
+
+      return { room: roomService.serializeRoom(room) };
+    },
+    { limit: 'joinRoom', errorEvent: ROOM_EVENTS.error.alias },
+  );
+
+  /** Declines an invitation. Needs no room: the invitee is not in one. */
+  on(
+    socket,
+    CLIENT_ROOM_INVITE_REJECT,
+    async ({ socket: sock }, payload) => {
+      const { invitationId } = parsePayload(payload, invitationTargetSchema);
+      await invitationService.reject(sock.data.user, invitationId);
+      return { rejected: true };
+    },
+    { limit: 'action', errorEvent: ROOM_EVENTS.error.alias },
   );
 
   // -------------------------------------------------------------- moderation
@@ -325,24 +412,55 @@ export function registerRoomHandlers(socket: GameSocket): void {
   );
 }
 
-/** Leaves whatever room this socket is currently in, if any. */
-async function leaveCurrentRoom(socket: GameSocket): Promise<void> {
+/**
+ * Leaves whatever room this player currently holds a seat in, if any.
+ *
+ * ## Why it looks at the registry and not only at `socket.data.roomId`
+ *
+ * That field is what *this connection* last entered, and it is usually the
+ * whole story. It is not always: a player who joined over REST has a seat and
+ * no socket room, and a second device that entered a different room leaves
+ * this one pointing at a room its owner has moved on from. In both cases the
+ * seat is real and invisible to a check that only reads the socket.
+ *
+ * So the seat is looked up where seats actually live. That is what makes the
+ * brief's "a user cannot join multiple active game rooms at the same time"
+ * true by construction on the socket path, rather than true only when the
+ * client behaved. The REST paths refuse outright instead of evicting, because
+ * there is no connection there whose intent could be read as "move me".
+ */
+async function leaveCurrentRoom(socket: GameSocket, keepRoomId?: string): Promise<void> {
+  const userId = socket.data.user.id;
   const roomId = socket.data.roomId;
-  if (!roomId) return;
 
-  const room = roomService.get(roomId);
-  socket.leave(roomChannel(roomId));
-  socket.data.roomId = null;
+  if (roomId && roomId !== keepRoomId) {
+    socket.leave(roomChannel(roomId));
+    socket.data.roomId = null;
+  }
 
+  const room = (roomId ? roomService.get(roomId) : null) ?? roomService.liveRoomOf(userId);
   if (!room) return;
 
-  const { roomEmpty } = await roomService.removePlayer(room, socket.data.user.id);
+  // The seat is already in the room this socket is about to enter. That is the
+  // ordinary shape of a REST join followed by a socket one — accepting an
+  // invitation over REST seats the account, and the connection then enters the
+  // same room — and giving the seat up only to take it again would announce a
+  // departure that never happened, hand the host role away, and close the room
+  // outright if this player were the only one left in it.
+  if (room.roomId === keepRoomId) return;
+
+  // The seat may be held on another of this player's connections, so those are
+  // taken out of the channel too rather than left listening to a room their
+  // owner is no longer in.
+  await removeUserFromRoomChannel(userId, room.roomId);
+
+  const { roomEmpty } = await roomService.removePlayer(room, userId);
   if (roomEmpty) {
     await roomService.close(room, 'last player left');
     return;
   }
 
-  await gameService.onPlayerLeft(room, socket.data.user.id);
+  await gameService.onPlayerLeft(room, userId);
   await gameService.broadcastState(room);
 }
 

@@ -177,6 +177,8 @@ reconnects, and land back in the lobby.
 | `friend_requests` | One row per request, kept after it resolves | `{pairKey}` unique-partial on `pending` · `{receiverId, status, createdAt}` · `{senderId, status, createdAt}` |
 | `friendships` | **One row per pair**, ids stored sorted | `{userAId, userBId}` unique · one per field for the `$or` |
 | `blocks` | Directional: belongs to the blocker | `{blockerId, blockedUserId}` unique · `{blockedUserId}` |
+| `room_invitations` | One row per invitation, kept after it resolves | `{roomId, inviteeId}` unique-partial on `pending` · `{inviteeId, status, createdAt:-1}` · `{status, expiresAt}` |
+| `notifications` | One nudge per person, expiring after 30 days | `{userId, createdAt:-1, _id:-1}` · `{userId, createdAt:-1}` partial on unread · `{expiresAt}` TTL |
 
 Two shapes are worth the note:
 
@@ -477,6 +479,40 @@ blocked user they were blocked. Unblocking does **not** restore the friendship
 it destroyed — quietly resurrecting something somebody deliberately ended would
 be the opposite of what they asked for.
 
+### Notifications
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/notifications?page=&limit=&unreadOnly=` | The caller's own inbox, newest first |
+| `PATCH` | `/api/notifications/:id/read` | Owner only |
+| `PATCH` | `/api/notifications/read-all` | Clears the whole backlog in one write |
+| `DELETE` | `/api/notifications/:id` | Owner only |
+
+**There is no create endpoint.** Every notification is written by a service,
+from an event that already happened — `notificationService.notify` is the only
+writer, and nothing else in the codebase touches the collection. A create route
+would be the whole of what a spam feature needs.
+
+Every response carries `unreadCount`, capped at 99, so the badge never needs a
+second request and a client never does the arithmetic itself. A client that
+decremented its own counter would drift the first time it missed a push —
+which happens on every backgrounded app — and nothing would correct it.
+
+A notification id is **not a capability**: ownership is the update's filter, so
+a stranger's id returns the same `NOT_FOUND` an id that never existed does.
+Marking an already-read row read is a no-op rather than an error.
+
+Rows carry an `expiresAt` 30 days out and a TTL index deletes them. Unlike
+`RoomInvitation.expiresAt` — which is a *state* the accept path checks, and
+deliberately not a TTL — expiry here really is deletion: everything a
+notification points at is stored authoritatively elsewhere and outlives the
+nudge.
+
+Producers today: friend request sent, friend request accepted, room invitation
+sent. Each writes the row *and* emits its existing domain event — the domain
+event tells a screen its list is stale, the notification event tells the badge
+its count changed, and a client is rarely showing both.
+
 ### `GET /api/health`
 
 Unauthenticated, so a load balancer probe works. Returns **503** when the
@@ -647,6 +683,30 @@ Note what is absent: nothing is sent to the person who was *blocked*, because
 being told would be exactly the disclosure the feature avoids. The one thing
 they can observe is a friendship that quietly ended — unavoidable, since the
 friend is simply not in their list any more.
+
+### Notification events
+
+| Event | Alias | Carries |
+|---|---|---|
+| `s:notification:new` | `notification:new` | The full row plus `unreadCount` |
+| `s:notification:unread` | `notification:unread` | `unreadCount` only |
+
+Addressed to a *player*, like the friend events above, and emitted under both
+vocabularies for the same reason.
+
+These are **additional** to the friend and invitation events, not a replacement
+for them. A friend request now emits `s:friend:requestReceived` *and*
+`s:notification:new`: the first tells a friends screen its cached list is
+stale, the second tells the badge its count changed. A client showing the
+friends screen acts on one; a client on the home screen acts on the other.
+Collapsing them would mean inferring every badge update from every domain event
+a client happens to know about — which is exactly the fan-out the notifications
+collection exists to centralise.
+
+`s:notification:new` carries the row so a toast can be drawn without a round
+trip. `s:notification:unread` deliberately does not: it fires when *this*
+player reads or deletes something on another device, and it exists so clearing
+a badge on a phone clears it on the tablet too.
 
 ### Drawing payloads
 

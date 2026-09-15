@@ -191,3 +191,46 @@ export async function removeUserFromRoomChannel(userId: string, roomId: string):
     logger.exception('failed to remove user from room channel', error, { userId, roomId });
   }
 }
+
+/**
+ * Whether this process is holding the sockets.
+ *
+ * The difference between "nobody is online" and "this process cannot see who
+ * is online" matters: in the split deployment the REST process has no server
+ * instance at all, and reporting every friend as offline there would be a
+ * confident lie. Callers use this to fall back to `lastSeenAt` instead.
+ */
+export function hasSocketServer(): boolean {
+  return instance() !== null;
+}
+
+/**
+ * Which of [userIds] are connected right now.
+ *
+ * ## Why the adapter is read directly
+ *
+ * Every socket joins `userChannel(user.id)` at handshake, so presence is
+ * already a fact the adapter holds: a channel with members is a person with a
+ * device open. Reading it is a map lookup per id, against `fetchSockets()`
+ * which is a round trip per id and returns whole socket objects this only
+ * needs the count of.
+ *
+ * The trade-off is that `adapter.rooms` is process-local. Under a Redis
+ * adapter it would report only the sockets attached *here*, so a player
+ * connected to another instance would read as offline. That is acceptable for
+ * what this drives — a dot beside a name in the invite sheet — and it is why
+ * nothing in the invitation rules depends on it: an offline friend can still
+ * be invited, and their invitation is waiting when they open the app.
+ */
+export function onlineUserIds(userIds: string[]): Set<string> {
+  const server = instance();
+  const online = new Set<string>();
+  if (!server) return online;
+
+  for (const userId of userIds) {
+    const channel = server.sockets.adapter.rooms.get(userChannel(userId));
+    if (channel && channel.size > 0) online.add(userId);
+  }
+
+  return online;
+}

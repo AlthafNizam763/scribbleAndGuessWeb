@@ -5,8 +5,10 @@ import { ChatMessage } from '@/models/ChatMessage';
 import { FriendRequest } from '@/models/FriendRequest';
 import { Friendship } from '@/models/Friendship';
 import { Game } from '@/models/Game';
+import { Notification } from '@/models/Notification';
 import { Report } from '@/models/Report';
 import { Room } from '@/models/Room';
+import { RoomInvitation } from '@/models/RoomInvitation';
 import { Round } from '@/models/Round';
 import { User } from '@/models/User';
 import { Word } from '@/models/Word';
@@ -54,11 +56,13 @@ const MODELS: SyncableModel[] = [
   Game,
   Round,
   Word,
+  Notification,
   ChatMessage,
   Report,
   FriendRequest,
   Friendship,
   Block,
+  RoomInvitation,
 ].map(
   asSyncable,
 );
@@ -70,10 +74,12 @@ const PLAY_DATA: SyncableModel[] = [
   Game,
   Round,
   ChatMessage,
+  Notification,
   Report,
   FriendRequest,
   Friendship,
   Block,
+  RoomInvitation,
 ].map(
   asSyncable,
 );

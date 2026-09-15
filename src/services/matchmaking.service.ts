@@ -3,10 +3,11 @@ import { blockRepository } from '@/repositories/block.repository';
 import { roomRepository } from '@/repositories/room.repository';
 import { defaultSettings, roomService } from '@/services/room.service';
 import type { AuthenticatedUser } from '@/types/auth.types';
-import type { RoomSettingsDto } from '@/types/room.types';
+import type { PublicRoomDto, RoomSettingsDto } from '@/types/room.types';
 import type { RuntimeRoom } from '@/types/socket.types';
 import { AppError, ErrorCode, errors } from '@/utils/errors';
 import { logger } from '@/utils/logger';
+import { roomDisplayName, sanitizeName } from '@/utils/sanitize';
 
 /**
  * Quick Play: find a public room worth joining, or open one.
@@ -219,12 +220,146 @@ export class MatchmakingService {
     return null;
   }
 
-  /** The live room this user is seated in, if any. */
+  /**
+   * The live room this user is seated in, if any.
+   *
+   * Delegates to the registry's own lookup rather than keeping a second scan:
+   * "one room at a time" is now enforced on the join, invite and accept paths
+   * too, and two implementations of the same question are how one of them ends
+   * up disagreeing with the rule it is supposed to enforce.
+   */
   roomOf(userId: string): RuntimeRoom | null {
-    for (const room of roomService.all()) {
-      if (!room.closed && room.players.has(userId)) return room;
+    return roomService.liveRoomOf(userId);
+  }
+
+  // -------------------------------------------------------- the public list --
+
+  /**
+   * Every public room this user could join, best first.
+   *
+   * ## Why this is the matchmaker's job
+   *
+   * The brief's filter for the Public Rooms screen — public, waiting, not
+   * full, not closed, not started, not banned, not sharing it with somebody
+   * blocked — is `rejectionFor` word for word. Quick Play answers "give me one
+   * of these" and the browser answers "show me all of them"; giving the screen
+   * its own copy of the rule is how a room ends up listed that Quick Play
+   * would refuse, or listed and then un-joinable.
+   *
+   * So there is one predicate, and both callers use it. A room that appears
+   * here is a room `joinPublic` will admit this player to — subject to the
+   * race below, which no amount of filtering can remove.
+   *
+   * ## The list is a hint, the join is the decision
+   *
+   * Occupancy is read the instant the page is built, and a room can fill
+   * before the player taps Join. That is why the join path re-checks rather
+   * than trusting a row: the list exists to save a player from tapping into
+   * refusals, not to make refusals impossible.
+   */
+  listPublic(userId: string, blockedIds: Set<string>, limit: number): PublicRoomDto[] {
+    return this.rankCandidates(userId, blockedIds)
+      .slice(0, limit)
+      .map((room) => this.describe(room));
+  }
+
+  /**
+   * One room as a stranger may see it.
+   *
+   * Note what is absent: the player list, the ban list, the custom words, the
+   * current word and the settings that only matter once you are inside. A
+   * browser row needs who is hosting, how full it is and what the rules
+   * roughly are — everything else would be telling people about a room they
+   * have not joined.
+   */
+  describe(room: RuntimeRoom): PublicRoomDto {
+    const host = room.players.get(room.hostId);
+    const hostName = sanitizeName(host?.username);
+
+    return {
+      id: room.roomId,
+      code: room.code,
+      name: roomDisplayName(hostName),
+      hostId: room.hostId,
+      hostName,
+      playerCount: room.players.size,
+      maxPlayers: room.settings.maxPlayers,
+      status: roomService.serializeRoom(room).status,
+      rounds: room.settings.rounds,
+      drawTimeSeconds: room.settings.drawTimeSeconds,
+      language: room.settings.language,
+      createdAtMs: room.createdAtMs,
+    };
+  }
+
+  /**
+   * The public list, read from storage instead of the registry.
+   *
+   * The split deployment again: the REST process has no registry, so it falls
+   * back to the last write-through. Everything the registry filter checks is
+   * re-checked here against the stored document, because the stored `status`
+   * is coarser than the live phase and would otherwise let a room that had
+   * just started slip into the list.
+   *
+   * The counts are a moment behind, which is exactly the staleness the join
+   * path exists to correct.
+   */
+  async listPublicFromStorage(
+    userId: string,
+    blockedIds: Set<string>,
+    limit: number,
+  ): Promise<PublicRoomDto[]> {
+    const rows = await roomRepository.findJoinablePublic({
+      limit: limit * 2,
+      excludeUserId: userId,
+    });
+
+    const defaults = defaultSettings();
+    const rooms: PublicRoomDto[] = [];
+
+    for (const row of rows) {
+      if (row.closedAt) continue;
+
+      const settings = { ...defaults, ...(row.settings as unknown as RoomSettingsDto) };
+      if (settings.isPrivate) continue;
+      if (row.players.length >= settings.maxPlayers) continue;
+      if (row.bannedUserIds.some((id) => String(id) === userId)) continue;
+
+      let excluded = false;
+      for (const player of row.players) {
+        const id = String(player.userId);
+        // Already seated here, or sharing it with somebody blocked.
+        if (id === userId || blockedIds.has(id)) {
+          excluded = true;
+          break;
+        }
+      }
+      if (excluded) continue;
+
+      const hostId = String(row.ownerId);
+      const hostName = sanitizeName(
+        row.players.find((player) => String(player.userId) === hostId)?.username,
+      );
+
+      rooms.push({
+        id: String(row._id),
+        code: row.roomCode,
+        name: roomDisplayName(hostName),
+        hostId,
+        hostName,
+        playerCount: row.players.length,
+        maxPlayers: settings.maxPlayers,
+        status: row.status as PublicRoomDto['status'],
+        rounds: settings.rounds,
+        drawTimeSeconds: settings.drawTimeSeconds,
+        language: settings.language,
+        createdAtMs: new Date(row.createdAt ?? Date.now()).getTime(),
+      });
     }
-    return null;
+
+    return rooms
+      .sort((a, b) => b.playerCount - a.playerCount || a.createdAtMs - b.createdAtMs)
+      .slice(0, limit);
   }
 
   // ------------------------------------------------------------- fallback --

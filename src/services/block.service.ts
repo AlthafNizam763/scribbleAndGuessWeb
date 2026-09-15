@@ -1,5 +1,6 @@
 import { PAGE_LIMITS } from '@/constants/social.constants';
 import { blockRepository } from '@/repositories/block.repository';
+import { invitationRepository } from '@/repositories/invitation.repository';
 import { friendRepository } from '@/repositories/friend.repository';
 import { userRepository } from '@/repositories/user.repository';
 import { toUserSummary, type RankableUser } from '@/services/profile.serialize';
@@ -65,13 +66,26 @@ export class BlockService {
       const cancelled = await friendRepository.cancelPendingBetween(blockerId, targetId);
       const unfriended = await friendRepository.removeFriendship(blockerId, targetId);
 
+      // And any room invitation still open between them, in either direction.
+      // An invitation that outlived the relationship it was sent on is exactly
+      // what a block exists to prevent — and `invite` already refuses a
+      // blocked target, so leaving the old row pending would be the one way
+      // around that check.
+      const invitations = await invitationRepository.expireBetween(blockerId, targetId);
+
       if (unfriended) {
         // The only push the blocked party gets, and it says nothing about the
         // block: their friend list changed, which they can see for themselves.
         notifyFriendEvent(targetId, 'removed', { user: { id: blockerId } });
       }
 
-      logger.info('user blocked', { blockerId, targetId, cancelled, unfriended });
+      logger.info('user blocked', {
+        blockerId,
+        targetId,
+        cancelled,
+        unfriended,
+        invitations,
+      });
     }
 
     // Sent to the blocker only. This is what refreshes *their* lists.

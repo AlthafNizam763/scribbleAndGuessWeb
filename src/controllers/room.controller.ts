@@ -5,19 +5,24 @@ import { getSocketServer } from '@/config/socket';
 import { requireUser } from '@/middleware/auth.middleware';
 import { ok } from '@/middleware/error.middleware';
 import { clientIdentity, enforceHttpLimit } from '@/middleware/rateLimit.middleware';
-import { parseBody } from '@/middleware/validation.middleware';
+import { parseBody, parseQuery } from '@/middleware/validation.middleware';
+import { blockRepository } from '@/repositories/block.repository';
 import { roomRepository } from '@/repositories/room.repository';
 import { chatService } from '@/services/chat.service';
 import { gameService } from '@/services/game.service';
+import { invitationPaging, invitationService } from '@/services/invitation.service';
 import { lobbyService } from '@/services/lobby.service';
 import { matchmakingService, quickPlaySettings } from '@/services/matchmaking.service';
 import { roomService } from '@/services/room.service';
-import { quickPlaySchema } from '@/validators/social.validator';
+import { pageQuerySchema, quickPlaySchema } from '@/validators/social.validator';
 import {
   createRoomSchema,
+  inviteToRoomSchema,
   joinRoomSchema,
   normalizeCreateRoomBody,
+  publicRoomsQuerySchema,
   readySchema,
+  roomObjectIdSchema,
   roomSettingsSchema,
   updateSettingsSchema,
 } from '@/validators/room.validator';
@@ -64,8 +69,15 @@ export const roomController = {
     const body = await parseBody(request, joinRoomSchema);
     const code = body.roomCode ?? body.code ?? '';
 
-    const room = roomService.getByCode(code);
+    const room = await resolveRoom(code);
     if (!room) throw errors.roomNotFound();
+
+    // The same two guards the id-shaped join and the invitation accept apply.
+    // A code is how you reach a room, not a licence to be in two of them, and
+    // "the room is full" has to be refused here as well or the REST path would
+    // be the way around a rule the socket path enforces.
+    invitationService.assertRoomAcceptsJoins(room, user.id);
+    invitationService.assertNotSeatedElsewhere(user.id, room.roomId);
 
     const { rejoined } = await roomService.joinRoom({ room, user });
 
@@ -174,7 +186,7 @@ export const roomController = {
 
     // Accepts either an id or a room code, because the client's lobby route is
     // `/room/:code` and it would otherwise have to keep a second identifier.
-    const room = roomService.get(roomId) ?? roomService.getByCode(roomId);
+    const room = await resolveRoom(roomId);
     if (!room) throw errors.roomNotFound();
 
     // Private rooms are not browsable: you have to be in one to read it.
@@ -194,7 +206,7 @@ export const roomController = {
     const user = await requireUser(request);
     await connectToDatabase();
 
-    const room = roomService.get(roomId) ?? roomService.getByCode(roomId);
+    const room = await resolveRoom(roomId);
     if (!room) throw errors.roomNotFound();
 
     const player = room.players.get(user.id);
@@ -218,7 +230,7 @@ export const roomController = {
     const user = await requireUser(request);
     await connectToDatabase();
 
-    const room = roomService.get(roomId) ?? roomService.getByCode(roomId);
+    const room = await resolveRoom(roomId);
     if (!room) throw errors.roomNotFound();
 
     const { settings } = await parseBody(request, updateSettingsSchema);
@@ -233,7 +245,7 @@ export const roomController = {
     const user = await requireUser(request);
     await connectToDatabase();
 
-    const room = roomService.get(roomId) ?? roomService.getByCode(roomId);
+    const room = await resolveRoom(roomId);
     if (!room) throw errors.roomNotFound();
 
     const { ready } = await parseBody(request, readySchema);
@@ -242,4 +254,255 @@ export const roomController = {
 
     return ok({ room: roomService.serializeRoom(room), lobby: lobbyService.snapshot(room) });
   },
+
+  // -------------------------------------------------------------------------
+  // Invitations
+  // -------------------------------------------------------------------------
+
+  /**
+   * `GET /api/rooms/:roomId/invite` — the caller's friends, annotated for this
+   * room.
+   *
+   * The invite sheet's data, and the reason it can grey out a button rather
+   * than let somebody tap into a refusal. Every flag on a row is decided by the
+   * server; see the note on that in `invitation.service.ts`.
+   *
+   * Reading it requires being in the room, for the same reason sending an
+   * invitation does: it discloses who is already seated.
+   */
+  async inviteCandidates(request: Request, roomId: string): Promise<NextResponse> {
+    const user = await requireUser(request);
+    await connectToDatabase();
+
+    const room = await resolveRoom(roomId);
+    if (!room) throw errors.roomNotFound();
+
+    roomService.assertMember(room, user.id);
+
+    const { limit } = parseQuery(request, pageQuerySchema);
+
+    return ok({
+      roomId: room.roomId,
+      roomCode: room.code,
+      playerCount: room.players.size,
+      maxPlayers: room.settings.maxPlayers,
+      items: await invitationService.listCandidates(room, user.id, limit),
+    });
+  },
+
+  /** `POST /api/rooms/:roomId/invite` — ask one friend to join. */
+  async invite(request: Request, roomId: string): Promise<NextResponse> {
+    const user = await requireUser(request);
+    enforceHttpLimit('roomInvite', clientIdentity(request, user.id));
+
+    await connectToDatabase();
+
+    const room = await resolveRoom(roomId);
+    if (!room) throw errors.roomNotFound();
+
+    const { inviteeId } = await parseBody(request, inviteToRoomSchema);
+
+    const invitation = await invitationService.invite({
+      room,
+      inviter: user,
+      inviteeId,
+    });
+
+    return ok({ invitation }, 201);
+  },
+
+  /** `GET /api/rooms/invitations?page=&limit=` — the caller's inbox. */
+  async listInvitations(request: Request): Promise<NextResponse> {
+    const user = await requireUser(request);
+    await connectToDatabase();
+
+    const { page, limit } = invitationPaging(parseQuery(request, pageQuerySchema));
+
+    return ok(await invitationService.listInvitations(user.id, page, limit));
+  },
+
+  /**
+   * `POST /api/rooms/invitations/:invitationId/accept`
+   *
+   * Takes the seat and hands the room back, so the client can go straight to
+   * the lobby without a second read. Their socket picks the seat up on its next
+   * `c:room:join`, exactly as it does for a room created over REST.
+   */
+  async acceptInvitation(request: Request, invitationId: string): Promise<NextResponse> {
+    const user = await requireUser(request);
+    enforceHttpLimit('invitationAction', clientIdentity(request, user.id));
+
+    await connectToDatabase();
+
+    const { room, rejoined } = await invitationService.accept(
+      user,
+      roomObjectIdSchema.parse(invitationId),
+    );
+
+    if (!rejoined) {
+      await chatService.presence(room, `${user.username} joined.`, true);
+      await gameService.broadcastState(room);
+    }
+
+    return ok({
+      room: roomService.serializeRoom(room),
+      roomCode: room.code,
+      joined: true,
+    });
+  },
+
+  /** `POST /api/rooms/invitations/:invitationId/reject` */
+  async rejectInvitation(request: Request, invitationId: string): Promise<NextResponse> {
+    const user = await requireUser(request);
+    enforceHttpLimit('invitationAction', clientIdentity(request, user.id));
+
+    await connectToDatabase();
+
+    await invitationService.reject(user, roomObjectIdSchema.parse(invitationId));
+
+    return ok({ rejected: true });
+  },
+
+  // -------------------------------------------------------------------------
+  // The public room list
+  // -------------------------------------------------------------------------
+
+  /**
+   * `GET /api/rooms/public?page=&limit=`
+   *
+   * Public, waiting, not full, not closed, not started, nothing the caller is
+   * banned from and nothing shared with somebody they have blocked. The filter
+   * is `matchmakingService.rejectionFor`, which is the same predicate Quick
+   * Play uses — see the note on that in `matchmaking.service.ts`.
+   *
+   * Private rooms are not merely hidden from this list: there is no parameter
+   * that would include one, which is what makes "do not allow joining private
+   * rooms through the public room list" true structurally rather than by
+   * remembering to filter.
+   */
+  async publicRooms(request: Request): Promise<NextResponse> {
+    const user = await requireUser(request);
+    enforceHttpLimit('publicRooms', clientIdentity(request, user.id));
+
+    await connectToDatabase();
+
+    const { page, limit } = parseQuery(request, publicRoomsQuerySchema);
+    const blocked = new Set(await blockRepository.relatedIds(user.id));
+
+    // The registry is exact about occupancy, and it is what the socket process
+    // holds. Where there is none — the split deployment's REST side — the last
+    // write-through is the best answer available, and the join re-checks it.
+    const items = getSocketServer()
+      ? matchmakingService.listPublic(user.id, blocked, limit)
+      : await matchmakingService.listPublicFromStorage(user.id, blocked, limit);
+
+    const current = roomService.liveRoomOf(user.id);
+
+    return ok({
+      items,
+      total: items.length,
+      page,
+      limit,
+      hasMore: false,
+      // So the screen can say "leave that room first" before the player taps
+      // Join and is refused. The refusal is still the server's; this only
+      // saves a round trip to hear it.
+      currentRoomId: current?.roomId ?? null,
+      currentRoomCode: current?.code ?? null,
+    });
+  },
+
+  // -------------------------------------------------------------------------
+  // Joining and membership
+  // -------------------------------------------------------------------------
+
+  /**
+   * `POST /api/rooms/:roomId/join`
+   *
+   * Joins by id or by code. Every rule the brief lists for a public-room join
+   * is checked here and nowhere else: the room still exists, it has space, the
+   * game has not started, and the caller is neither banned nor already seated
+   * somewhere else.
+   *
+   * A private room is joinable through this endpoint by somebody holding its
+   * code or its id, which is the same rule the socket join applies — a
+   * code-only room is exactly a room you need the code for. What it is not is
+   * browsable; see `publicRooms`.
+   */
+  async joinById(request: Request, roomId: string): Promise<NextResponse> {
+    const user = await requireUser(request);
+    enforceHttpLimit('joinRoom', clientIdentity(request, user.id));
+
+    await connectToDatabase();
+
+    const room = await resolveRoom(roomId);
+    if (!room) throw errors.roomNotFound();
+
+    invitationService.assertRoomAcceptsJoins(room, user.id);
+    invitationService.assertNotSeatedElsewhere(user.id, room.roomId);
+
+    const { rejoined } = await roomService.joinRoom({ room, user });
+
+    if (!rejoined) {
+      await chatService.presence(room, `${user.username} joined.`, true);
+      await gameService.broadcastState(room);
+    }
+
+    return ok({
+      room: roomService.serializeRoom(room),
+      roomCode: room.code,
+      joined: true,
+      rejoined,
+    });
+  },
+
+  /**
+   * `GET /api/rooms/:roomId/members`
+   *
+   * Members only. A player list is not public information — it is who is in
+   * the building — and a stranger who could read it for any room could follow
+   * somebody around the lobby list. The public browser gets a count instead.
+   */
+  async members(request: Request, roomId: string): Promise<NextResponse> {
+    const user = await requireUser(request);
+    await connectToDatabase();
+
+    const room = await resolveRoom(roomId);
+    if (!room) throw errors.roomNotFound();
+
+    roomService.assertMember(room, user.id);
+
+    const snapshot = roomService.serializeRoom(room);
+
+    return ok({
+      roomId: room.roomId,
+      roomCode: room.code,
+      hostId: room.hostId,
+      playerCount: room.players.size,
+      maxPlayers: room.settings.maxPlayers,
+      status: snapshot.status,
+      members: snapshot.players,
+    });
+  },
 };
+
+/**
+ * The live room for an id or a code, hydrating it from storage if need be.
+ *
+ * Every room endpoint accepts both, because the client's lobby route is
+ * `/room/:code` while invitation and browser rows carry ids, and making
+ * callers keep two identifiers straight is how one of them eventually sends
+ * the wrong one. A miss falls through to storage for the same reason
+ * `roomService.resolveByCode` does: a room created by the other process, or
+ * one that outlived a restart, is live and joinable but not in this registry.
+ */
+async function resolveRoom(idOrCode: string) {
+  const direct = roomService.get(idOrCode) ?? roomService.getByCode(idOrCode);
+  if (direct) return direct;
+
+  // A five-character code can never be a 24-character Mongo id, so the two
+  // lookups cannot collide; this only decides which storage read is tried.
+  if (/^[0-9a-fA-F]{24}$/.test(idOrCode)) return roomService.hydrate(idOrCode);
+
+  return roomService.resolveByCode(idOrCode);
+}

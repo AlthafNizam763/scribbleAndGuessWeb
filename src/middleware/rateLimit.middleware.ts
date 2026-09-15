@@ -107,6 +107,55 @@ export const RATE_LIMITS = {
    * client stuck in a retry loop.
    */
   quickPlay: { burst: 5, perSecond: 0.2 },
+  /**
+   * Sending a room invitation.
+   *
+   * Sized like `friendRequest` and for the same reason: it is the other action
+   * in this app that puts a notification in somebody else's list without their
+   * asking. The burst covers inviting the four friends you meant to play with
+   * in one go; the sustained rate makes an invitation spray pointless.
+   *
+   * It is not the only bound. `invitation.service.ts` also caps how many
+   * invitations one player may have *outstanding* to one room, which is the
+   * shape the abuse takes when it is spread over time rather than burst.
+   */
+  roomInvite: { burst: 6, perSecond: 0.1 },
+  /**
+   * Answering an invitation.
+   *
+   * Looser than sending, exactly as `friendAction` is looser than
+   * `friendRequest`: these act on a row that already exists and the worst a
+   * burst does is churn the caller's own inbox.
+   */
+  invitationAction: { burst: 20, perSecond: 1 },
+  /**
+   * Browsing public rooms.
+   *
+   * A read, and normally an in-memory one, so this is generous — a player
+   * pulling to refresh while they wait for a room to fill is doing the thing
+   * the screen is for. The burst absorbs that; the sustained rate stops a
+   * client stuck in a polling loop from scanning Mongo several times a second
+   * in the split deployment, where this read is not in memory.
+   */
+  publicRooms: { burst: 15, perSecond: 1 },
+  /**
+   * Reading the notification inbox.
+   *
+   * A read, and one a client makes on every app open and every pull to
+   * refresh, so this is generous. The sustained rate is what stops a client
+   * stuck in a polling loop from running three indexed queries a second
+   * against the collection with the highest write rate in the app.
+   */
+  notificationRead: { burst: 20, perSecond: 2 },
+  /**
+   * Marking read, marking all read, deleting.
+   *
+   * Looser than reading and sized like `friendAction`, for the same reason:
+   * every one of these acts on a row the caller already owns, so the worst a
+   * burst does is churn their own inbox. The burst covers clearing a backlog
+   * by tapping through it.
+   */
+  notificationAction: { burst: 30, perSecond: 2 },
   /** Anything else with an ack. */
   action: { burst: 20, perSecond: 5 },
 } as const satisfies Record<string, RateLimitRule>;

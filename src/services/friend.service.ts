@@ -1,7 +1,9 @@
+import { NOTIFICATION_TYPE } from '@/constants/notification.constants';
 import { FRIEND_REQUEST_STATUS, PAGE_LIMITS, RELATION, type RelationWire } from '@/constants/social.constants';
 import { blockRepository } from '@/repositories/block.repository';
 import { friendRepository, isDuplicateKeyError } from '@/repositories/friend.repository';
 import { userRepository } from '@/repositories/user.repository';
+import { notificationService } from '@/services/notification.service';
 import { notifyFriendEvent } from '@/services/social.notify';
 import { toUserStats, toUserSummary, type RankableUser } from '@/services/profile.serialize';
 import type { FriendDto, FriendRequestDto, UserSummaryDto } from '@/types/social.types';
@@ -87,6 +89,20 @@ export class FriendService {
         user: toUserSummary(sender as RankableUser),
       });
 
+      // The durable half of the same nudge. The friend event tells an open
+      // friends screen its list is stale; this is what the receiver finds
+      // waiting if they were not connected at all. Not awaited: the request
+      // has already been written, and a notification is never worth failing
+      // it for.
+      void notificationService.notify({
+        userId: receiverId,
+        type: NOTIFICATION_TYPE.friendRequest,
+        title: 'New friend request',
+        body: `${sender.username} wants to be your friend.`,
+        actorId: senderId,
+        data: { requestId: String(created._id) },
+      });
+
       logger.info('friend request sent', { senderId, receiverId });
 
       return {
@@ -152,6 +168,17 @@ export class FriendService {
       requestId,
       user: receiver ? toUserSummary(receiver as RankableUser) : { id: userId, username: '', avatarId: 0, avatarColorIndex: 0 },
     });
+
+    if (receiver) {
+      void notificationService.notify({
+        userId: senderId,
+        type: NOTIFICATION_TYPE.friendRequestAccepted,
+        title: 'Request accepted',
+        body: `${receiver.username} accepted your friend request.`,
+        actorId: userId,
+        data: { requestId, friendId: userId },
+      });
+    }
 
     logger.info('friend request accepted', { userId, senderId });
 

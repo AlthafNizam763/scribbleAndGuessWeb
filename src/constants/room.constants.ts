@@ -99,3 +99,32 @@ export type ChatTypeWire = (typeof CHAT_TYPE)[keyof typeof CHAT_TYPE];
 /** `GuessVerdict` from the client's guess matcher. */
 export const VERDICT = { correct: 'correct', close: 'close', wrong: 'wrong' } as const;
 export type VerdictWire = (typeof VERDICT)[keyof typeof VERDICT];
+
+/**
+ * The lifecycle of a room invitation.
+ *
+ * ## Why `expired` is a stored status and not merely a date comparison
+ *
+ * An invitation carries an `expiresAt`, so "is this still good" is answerable
+ * without writing anything — and the accept path does exactly that, because a
+ * row that lapsed one millisecond ago must be refused whether or not a sweeper
+ * has run yet.
+ *
+ * The status exists anyway because the *unique index* keys off it. Only
+ * `pending` rows constrain a re-invite, so a lapsed invitation that stayed
+ * `pending` forever would block the same friend from ever being asked again.
+ * Writing `expired` is what releases the slot; the date is what decides.
+ */
+export const INVITATION_STATUS = {
+  /** Sent, unanswered, and not yet past `expiresAt`. */
+  pending: 'pending',
+  /** The invitee accepted. They may or may not still be in the room. */
+  accepted: 'accepted',
+  /** The invitee declined. */
+  rejected: 'rejected',
+  /** Nobody answered in time, or the room closed underneath it. */
+  expired: 'expired',
+} as const;
+
+export type InvitationStatusWire =
+  (typeof INVITATION_STATUS)[keyof typeof INVITATION_STATUS];

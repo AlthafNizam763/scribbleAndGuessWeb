@@ -202,3 +202,72 @@ export function normalizeCreateRoomBody(body: z.infer<typeof createRoomSchema>):
 
   return flat;
 }
+
+// ---------------------------------------------------------------------------
+// Invitations and the public room list
+// ---------------------------------------------------------------------------
+
+/**
+ * A Mongo id as it arrives in a path segment or a body.
+ *
+ * Re-declared here rather than imported from `social.validator.ts` so the room
+ * validators do not depend on the social ones for a regex; both are the same
+ * two locks on the same door as `isObjectId` in the repository layer.
+ */
+export const roomObjectIdSchema = z
+  .string()
+  .trim()
+  .regex(/^[0-9a-fA-F]{24}$/, 'That is not a valid id.');
+
+/**
+ * `POST /api/rooms/:roomId/invite`.
+ *
+ * Names the invitee and nothing else. There is no `inviterId` and no `roomId`
+ * in the body: the inviter is the token and the room is the path, so there is
+ * no field a caller could use to invite somebody *as* another player or into
+ * a room they are not in. The same structural refusal
+ * `sendFriendRequestSchema` makes.
+ *
+ * Both `friendId` and `userId` are accepted for the one field, because both
+ * spellings are natural and a client that guesses wrong would otherwise get a
+ * validation error it cannot diagnose.
+ */
+export const inviteToRoomSchema = z
+  .object({
+    friendId: roomObjectIdSchema.optional(),
+    userId: roomObjectIdSchema.optional(),
+    inviteeId: roomObjectIdSchema.optional(),
+  })
+  .refine(
+    (body) =>
+      body.friendId !== undefined ||
+      body.userId !== undefined ||
+      body.inviteeId !== undefined,
+    { message: 'A player id is required.' },
+  )
+  .transform((body) => ({
+    inviteeId: (body.inviteeId ?? body.friendId ?? body.userId) as string,
+  }));
+
+/** Any socket event naming one invitation. */
+export const invitationTargetSchema = z.object({
+  invitationId: roomObjectIdSchema,
+});
+
+/**
+ * `GET /api/rooms/public?page=&limit=`.
+ *
+ * Clamped rather than refused, like every other list bound in this codebase.
+ * The ceiling is lower than the social lists' hundred because each row is a
+ * live room rather than a stored document, and a browser showing fifty open
+ * rooms is already showing more than anybody scrolls.
+ */
+export const publicRoomsQuerySchema = z.object({
+  page: z.coerce.number().int().catch(1).default(1),
+  limit: z.coerce
+    .number()
+    .int()
+    .catch(25)
+    .default(25)
+    .transform((value) => Math.min(Math.max(value, 1), 50)),
+});

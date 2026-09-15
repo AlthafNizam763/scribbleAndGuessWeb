@@ -16,6 +16,7 @@ import { roundRepository } from '@/repositories/round.repository';
 import { userRepository } from '@/repositories/user.repository';
 import { chatService } from '@/services/chat.service';
 import { hintSchedule, letterCount, maskWord, nextHintIndices } from '@/services/hint.service';
+import { notifyRoomEvent } from '@/services/room.notify';
 import { roomService } from '@/services/room.service';
 import { scoringService } from '@/services/scoring.service';
 import { TIMER, timerService } from '@/services/timer.service';
@@ -158,7 +159,17 @@ export class GameService {
   async broadcastState(room: RuntimeRoom): Promise<void> {
     voiceService.reconcile(room);
 
-    emitToRoom(room.roomId, SERVER_ROOM_STATE, { room: roomService.serializeRoom(room) });
+    const snapshot = roomService.serializeRoom(room);
+
+    emitToRoom(room.roomId, SERVER_ROOM_STATE, { room: snapshot });
+
+    // The brief's `room:updated`, carrying the same snapshot `s:room:state`
+    // just delivered. Emitted here rather than at each mutation site because
+    // this method is the one thing every membership, settings and phase change
+    // already funnels through — a second set of call sites is how one of them
+    // eventually gets forgotten.
+    notifyRoomEvent(room.roomId, 'updated', { room: snapshot });
+
     await emitPerViewer(room.roomId, SERVER_GAME_STATE, (viewerId) => ({
       game: this.serializeGameState(room, viewerId),
     }));

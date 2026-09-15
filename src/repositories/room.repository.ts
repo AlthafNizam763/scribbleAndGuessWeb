@@ -40,6 +40,24 @@ export const roomRepository = {
     return existing !== null;
   },
 
+  /**
+   * Several rooms in one read, for a list that names rooms it is not in.
+   *
+   * The invitations inbox is the caller: a page of invitations points at up to
+   * twenty-five different rooms, and a lookup per row would be twenty-five
+   * round trips to render one screen. Closed rooms are returned rather than
+   * filtered — the caller needs to know an invitation points at a dead room so
+   * it can say so, and dropping the row here would render it as a blank.
+   */
+  async findManyByIds(roomIds: string[]) {
+    const ids = roomIds.filter(isObjectId);
+    if (ids.length === 0) return [];
+
+    return Room.find({ _id: { $in: ids } })
+      .lean()
+      .exec();
+  },
+
   /** Every live room this user is seated in. Used to restore after a reconnect. */
   async findLiveForUser(userId: string) {
     if (!isObjectId(userId)) return [];

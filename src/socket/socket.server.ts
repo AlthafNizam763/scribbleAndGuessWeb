@@ -3,6 +3,7 @@ import type { Server as HttpServer } from 'node:http';
 import { createSocketServer } from '@/config/socket';
 import { TIMING } from '@/constants/game.constants';
 import { SERVER_TIME_SYNC } from '@/constants/socket.constants';
+import { invitationService } from '@/services/invitation.service';
 import { presenceService } from '@/services/presence.service';
 import { registerChatHandlers } from '@/socket/chat.socket';
 import { registerDrawingHandlers } from '@/socket/drawing.socket';
@@ -60,6 +61,20 @@ export function attachSocketServer(httpServer: HttpServer): GameServer {
     clock.unref?.();
 
     presenceService.startSweeper();
+
+    // Retires invitations nobody answered. On its own interval rather than
+    // folded into the room sweep because the two are unrelated: an invitation
+    // lapses on its own clock whether or not any room changed, and the room
+    // sweep runs twice as often as this needs to.
+    //
+    // Correctness never depends on it. The accept path compares against
+    // `expiresAt` directly, so a lapsed invitation is refused whether or not
+    // the sweeper has reached it; what this buys is releasing the unique-index
+    // slot, so the same friend can be invited to that room again.
+    const invitations = setInterval(() => {
+      void invitationService.expireLapsed();
+    }, TIMING.invitationSweepIntervalMs);
+    invitations.unref?.();
   }
 
   logger.info('socket.io attached');

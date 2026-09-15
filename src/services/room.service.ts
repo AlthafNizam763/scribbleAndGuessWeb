@@ -1,5 +1,6 @@
 import { ROOM_DEFAULTS, TIMING } from '@/constants/game.constants';
 import { CONNECTION, GAME_PHASE, ROOM_STATUS } from '@/constants/room.constants';
+import { invitationRepository } from '@/repositories/invitation.repository';
 import { roomRepository } from '@/repositories/room.repository';
 import { userRepository } from '@/repositories/user.repository';
 import type { AuthenticatedUser } from '@/types/auth.types';
@@ -8,6 +9,7 @@ import type { RuntimePlayer, RuntimeRoom } from '@/types/socket.types';
 import { errors } from '@/utils/errors';
 import { generateUniqueRoomCode, normalizeRoomCode } from '@/utils/generateRoomCode';
 import { logger } from '@/utils/logger';
+import { notifyRoomEvent } from '@/services/room.notify';
 import { timerService } from '@/services/timer.service';
 import { voiceService } from '@/services/voice.service';
 
@@ -84,6 +86,26 @@ export class RoomService {
   /** Every live room. Used by the sweeper and by health reporting. */
   all(): RuntimeRoom[] {
     return [...registry.byId.values()];
+  }
+
+  /**
+   * The live room this user is seated in, if any.
+   *
+   * The registry has no user index, so this is a scan — over the rooms this
+   * process is holding, which is a handful even under load, and only on the
+   * join and invite paths rather than per packet. An index would be a second
+   * structure to keep in step with `players`, and the failure mode of getting
+   * that wrong is a player who can never join anything again.
+   *
+   * This is what makes "one room at a time" answerable at all: a seat is held
+   * in the registry, not on a socket, so a player who joined over REST and
+   * then opened a socket is still, correctly, in one room.
+   */
+  liveRoomOf(userId: string): RuntimeRoom | null {
+    for (const room of registry.byId.values()) {
+      if (!room.closed && room.players.has(userId)) return room;
+    }
+    return null;
   }
 
   // ------------------------------------------------------------- lifecycle --
@@ -266,6 +288,17 @@ export class RoomService {
       logger.exception('failed to mark room closed', error, { roomId: room.roomId });
     });
 
+    // Every unanswered invitation to this room is now an invitation to
+    // nowhere. Expiring them here rather than waiting for the sweeper is what
+    // stops somebody's inbox showing a room they can tap and only then be told
+    // is gone — and it releases the unique-index slot, so the same friend can
+    // be invited to whatever room is opened next.
+    await invitationRepository.expireForRoom(room.roomId).catch((error: unknown) => {
+      logger.exception('failed to expire room invitations', error, {
+        roomId: room.roomId,
+      });
+    });
+
     logger.info('room closed', { roomId: room.roomId, code: room.code, reason });
   }
 
@@ -358,6 +391,17 @@ export class RoomService {
     await this.persist(room);
     await userRepository.touch(user.id);
 
+    // The brief's `room:player_joined`. Only for a genuinely new seat: a
+    // reconnecting member never left, and announcing their return as an
+    // arrival would put a second "joined" line in front of everybody who
+    // watched them drop. The `room:updated` snapshot covers that case.
+    notifyRoomEvent(room.roomId, 'playerJoined', {
+      roomId: room.roomId,
+      player: this.serializePlayer(room, player),
+      playerCount: room.players.size,
+      maxPlayers: room.settings.maxPlayers,
+    });
+
     logger.info('player joined', { roomId: room.roomId, userId: user.id });
     return { player, rejoined: false };
   }
@@ -376,6 +420,18 @@ export class RoomService {
 
     room.players.delete(userId);
     room.turnOrder = room.turnOrder.filter((id) => id !== userId);
+
+    // The brief's `room:player_left`. Emitted here rather than at the four
+    // call sites that can remove somebody — leaving, being kicked, timing out,
+    // the room closing — because this is the one place all of them pass
+    // through, and a fifth exit path added later gets it for free.
+    notifyRoomEvent(room.roomId, 'playerLeft', {
+      roomId: room.roomId,
+      playerId: userId,
+      username: player.username,
+      playerCount: room.players.size,
+      maxPlayers: room.settings.maxPlayers,
+    });
 
     // A vote to kick somebody who has left is meaningless.
     if (room.voteKick?.targetId === userId) room.voteKick = null;
