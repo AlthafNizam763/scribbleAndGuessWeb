@@ -9,31 +9,111 @@
  * exactly why it cannot express what is wanted here.
  *
  * This file describes a *knockout* tournament that an organiser bot creates,
- * fills, brackets, runs and replaces without anybody pressing anything. A
- * bracket has pairings, and pairings have to be decided at a moment: somebody
- * has to close registration, count who actually turned up, seed them, and open
- * the first matches. There is no arrangement of timestamps that does that on
- * its own, so this system has a stored `status` and a scheduler that advances
- * it. The two live side by side and share no rows.
+ * fills, brackets and runs without anybody pressing anything. A bracket has
+ * pairings, and pairings have to be decided at a moment: somebody has to close
+ * registration, count who actually turned up, seed them, and open the first
+ * matches. There is no arrangement of timestamps that does that on its own, so
+ * this system has a stored `status` and a scheduler that advances it. The two
+ * live side by side and share no rows.
  *
- * ## The three slots
+ * ## Three a day, and what that changed
  *
- * The product rule is "exactly three tournaments, always". That is modelled as
- * three numbered *slots*, each holding at most one tournament that is not yet
- * finished. A slot is released when its tournament completes or is cancelled,
- * and the scheduler immediately creates a replacement in it. Making the slot
- * the unit — rather than counting active tournaments — is what makes "never a
- * fourth" enforceable by a unique index rather than by a count that two
- * schedulers could read at the same time.
+ * The product rule is **exactly three tournaments per calendar day**, at three
+ * named times. It used to be "three at once, refilled the moment one ends",
+ * and the difference is not a number — it is what identifies a tournament.
+ *
+ * A rolling slot is a *position*: slot 2 is whatever is in slot 2 right now,
+ * and the same slot holds a different tournament every hour. A daily slot is a
+ * *date and a time of day*: the morning tournament of 2026-09-16 is one event
+ * for all time, it exists whether or not anybody joins it, and when it is over
+ * nothing replaces it — the next one is the afternoon, which was always going
+ * to happen anyway.
+ *
+ * That is why `{tournamentDate, dailySlot}` is the identity and the unique
+ * index, and why nothing here counts live tournaments to decide whether to
+ * create another. Counting is a read, creating is a write, and two schedulers
+ * can both read `2` before either writes. Naming the slot turns "never a
+ * fourth" into a write the database refuses.
  */
 
-/** How many tournaments run at once. The product rule, in one number. */
-export const TOURNAMENT_SLOT_COUNT = 3;
+/** How many tournaments exist on one calendar day. The product rule. */
+export const TOURNAMENTS_PER_DAY = 3;
 
-/** The slot numbers, as a list, so callers do not build ranges by hand. */
-export const TOURNAMENT_SLOTS: readonly number[] = Object.freeze(
-  Array.from({ length: TOURNAMENT_SLOT_COUNT }, (_, index) => index + 1),
-);
+/**
+ * The three times of day a tournament happens at.
+ *
+ * Named rather than numbered because the name is shown to a player and has to
+ * survive a change of clock: moving the evening tournament from 20:00 to 21:00
+ * is a configuration change, and every row already stamped `EVENING` is still
+ * correct afterwards. A stored `20:00` would have needed migrating.
+ */
+export const DAILY_SLOT = {
+  morning: 'MORNING',
+  afternoon: 'AFTERNOON',
+  evening: 'EVENING',
+} as const;
+
+export type DailySlotWire = (typeof DAILY_SLOT)[keyof typeof DAILY_SLOT];
+
+/** The slots in the order they happen. The listing's sort order. */
+export const DAILY_SLOTS: readonly DailySlotWire[] = Object.freeze([
+  DAILY_SLOT.morning,
+  DAILY_SLOT.afternoon,
+  DAILY_SLOT.evening,
+]);
+
+/**
+ * A slot's position in the day, 1-based.
+ *
+ * Denormalised onto each row as `slotNumber` so a listing sorts in the
+ * database rather than in memory — Mongo cannot order by a hand-written
+ * sequence of strings, and "MORNING, AFTERNOON, EVENING" is not alphabetical.
+ */
+export const DAILY_SLOT_ORDER: Readonly<Record<DailySlotWire, number>> = Object.freeze({
+  [DAILY_SLOT.morning]: 1,
+  [DAILY_SLOT.afternoon]: 2,
+  [DAILY_SLOT.evening]: 3,
+});
+
+/**
+ * The names a daily tournament can be given.
+ *
+ * ## Why a fixed pool and not a generator
+ *
+ * Because a player has to be able to say which one they mean. "Ink Royale" is
+ * a thing you can tell a friend to join; a generated name is a string nobody
+ * can repeat and nobody can search for. Twenty is enough that the rotation
+ * takes three weeks to come round — long enough that the same name never
+ * reads as the same tournament — and small enough that they are all good.
+ *
+ * Every one of them is short, pronounceable and says "drawing competition".
+ * None of them contains a player's name, a winner's name or a date: the name
+ * is chosen when the tournament is created and never written again, so a
+ * name that referred to a result would be a name that was wrong until the
+ * result existed. See `name.service.ts` for how three are picked per day.
+ */
+export const TOURNAMENT_NAME_POOL: readonly string[] = Object.freeze([
+  'Ink Royale',
+  'Doodle Rush',
+  'Sketch Clash',
+  'Scribble Storm',
+  'Canvas Kings',
+  'Draw Duel',
+  'Pencil Panic',
+  'Sketch Masters',
+  'Ink Warriors',
+  'Doodle League',
+  'Brush Battle',
+  'The Drawing Cup',
+  'Sketch Legends',
+  'Paper Champions',
+  'The Scribble Cup',
+  'Creative Clash',
+  'Drawing Rivals',
+  'Masterpiece Match',
+  'Ink Arena',
+  'Ultimate Doodle Cup',
+]);
 
 /**
  * Where an automatic tournament is in its life.
@@ -44,17 +124,48 @@ export const TOURNAMENT_SLOTS: readonly number[] = Object.freeze(
  * transition rather than two.
  */
 export const AUTO_TOURNAMENT_STATUS = {
-  /** Created, registration has not opened. Usually momentary. */
+  /**
+   * Created and scheduled; registration has not opened yet.
+   *
+   * The state a daily tournament spends most of its life in. The evening
+   * tournament is created at the start of the day and sits here for hours,
+   * showing a start time and a countdown, which is the whole point of
+   * publishing a schedule rather than a surprise.
+   */
   upcoming: 'UPCOMING',
   /** Anybody may register. */
   registration: 'REGISTRATION',
-  /** Registration closed; registered humans must confirm they are here. */
+  /**
+   * Registration closed; the roster is final and the start countdown is
+   * running.
+   *
+   * ## Not reached by a daily tournament
+   *
+   * This is the fast-start path's last phase, used by a deployment that runs
+   * with `checkInEnabled` off: the roster seals and a fifteen-second clock
+   * runs. A daily tournament seals at check-in instead, because it has a
+   * published start time and does not need to invent one.
+   *
+   * Kept in the enum, in `LIVE_STATUSES` and handled by the scheduler, because
+   * a deploy can land while a tournament is sitting in it and that tournament
+   * still has to reach a bracket rather than becoming a row nothing advances.
+   */
+  starting: 'STARTING',
+  /**
+   * Registration closed; registered humans must confirm they are here.
+   *
+   * The daily model's last gate before the bracket. Registration for the
+   * evening tournament can open hours before it starts, so "are you still
+   * there?" is a real question with a real answer — unlike in the rolling
+   * model, where the whole window was two minutes and asking it was the delay
+   * it was meant to prevent.
+   */
   checkIn: 'CHECK_IN',
   /** Bracket drawn, matches being played. */
   running: 'RUNNING',
-  /** Finished, with a winner. The slot is released. */
+  /** Finished, with a winner. The card stays, showing the result. */
   completed: 'COMPLETED',
-  /** Abandoned before it could run. The slot is released. */
+  /** Abandoned before it could run. Nothing replaces it. */
   cancelled: 'CANCELLED',
 } as const;
 
@@ -62,22 +173,37 @@ export type AutoTournamentStatusWire =
   (typeof AUTO_TOURNAMENT_STATUS)[keyof typeof AUTO_TOURNAMENT_STATUS];
 
 /**
- * The statuses that hold a slot.
+ * The statuses of a tournament that has not finished.
  *
- * A tournament in any of these occupies its slot and blocks a replacement.
- * The unique partial index in `AutoTournament` is built from exactly this
- * list, so "never a fourth tournament" and "never two in one slot" are the
- * same fact expressed once.
+ * What the scheduler sweeps and what a player can still be *in*. It no longer
+ * decides whether another tournament may be created — that is
+ * `{tournamentDate, dailySlot}` and the unique index on it, which holds
+ * whatever status the row is in. A completed morning tournament does not free
+ * anything up, because the afternoon one was never waiting on it.
  */
-export const SLOT_HOLDING_STATUSES: readonly AutoTournamentStatusWire[] = Object.freeze([
+export const LIVE_STATUSES: readonly AutoTournamentStatusWire[] = Object.freeze([
   AUTO_TOURNAMENT_STATUS.upcoming,
   AUTO_TOURNAMENT_STATUS.registration,
+  AUTO_TOURNAMENT_STATUS.starting,
+  AUTO_TOURNAMENT_STATUS.checkIn,
+  AUTO_TOURNAMENT_STATUS.running,
+]);
+
+/** The statuses in which a tournament is over, however it ended. */
+export const FINISHED_STATUSES: readonly AutoTournamentStatusWire[] = Object.freeze([
+  AUTO_TOURNAMENT_STATUS.completed,
+  AUTO_TOURNAMENT_STATUS.cancelled,
+]);
+
+/** The statuses in which the roster is final and nobody new may join. */
+export const SEALED_STATUSES: readonly AutoTournamentStatusWire[] = Object.freeze([
+  AUTO_TOURNAMENT_STATUS.starting,
   AUTO_TOURNAMENT_STATUS.checkIn,
   AUTO_TOURNAMENT_STATUS.running,
 ]);
 
 /** The statuses in which a player is considered to be *in* a tournament. */
-export const ACTIVE_PARTICIPATION_STATUSES = SLOT_HOLDING_STATUSES;
+export const ACTIVE_PARTICIPATION_STATUSES = LIVE_STATUSES;
 
 /** The only format the automatic system runs. */
 export const AUTO_TOURNAMENT_FORMAT = 'KNOCKOUT' as const;
@@ -190,9 +316,6 @@ export type MatchOutcomeWire = (typeof MATCH_OUTCOME)[keyof typeof MATCH_OUTCOME
  * environment — see `env.tournament`.
  */
 export const AUTO_TOURNAMENT_DEFAULTS = {
-  /** The public name every tournament is built from. */
-  namePrefix: 'Daily Scribble Cup',
-
   /** Fewest players a tournament may start with, humans and bots together. */
   minPlayers: 4,
   /** Most players a tournament may hold. */
@@ -212,10 +335,97 @@ export const AUTO_TOURNAMENT_DEFAULTS = {
   /** The difficulty bots are added at. */
   botDifficulty: BOT_DIFFICULTY.normal,
 
-  /** How long registration stays open. */
-  registrationMs: 10 * 60 * 1000,
-  /** How long registered humans have to confirm. */
-  checkInMs: 2 * 60 * 1000,
+  /**
+   * When each daily tournament starts, as minutes after local midnight.
+   *
+   * 10:00, 15:00 and 20:00 — mid-morning, mid-afternoon, and the evening slot
+   * in the hours people actually play. Local to `timeZone` below, so these are
+   * the times a player reads on their own clock rather than a UTC offset they
+   * have to do arithmetic on.
+   *
+   * Every one of the timings under this is measured *backwards* from the
+   * start, because the start is the thing that was published. A tournament
+   * announced for eight in the evening has to begin at eight in the evening;
+   * the windows in front of it are arranged to fit.
+   */
+  slotMinutes: {
+    [DAILY_SLOT.morning]: 10 * 60,
+    [DAILY_SLOT.afternoon]: 15 * 60,
+    [DAILY_SLOT.evening]: 20 * 60,
+  },
+
+  /**
+   * The timezone the calendar day and the slot times are read in.
+   *
+   * ## Why this is configured and not the server's own clock
+   *
+   * Because the server's clock is UTC on a host in Oregon and the players are
+   * not. "Three tournaments a day" is a promise about *their* day: the evening
+   * tournament has to be in the evening where somebody is sitting, and the day
+   * has to roll over while they are asleep rather than in the middle of their
+   * afternoon. Reading the host's zone would make both of those an accident of
+   * where the deployment happens to run, and would change them silently the
+   * day it moves.
+   */
+  timeZone: 'Asia/Kolkata',
+
+  /**
+   * How long before the start registration opens.
+   *
+   * Ninety minutes. Long enough that somebody who opens the app over lunch can
+   * take a place in the afternoon tournament and come back for it; short
+   * enough that the roster is not a list of people who signed up this morning
+   * and forgot. It is also why check-in exists at all in the daily model —
+   * over an hour and a half, "are you still here?" is a real question.
+   */
+  registrationLeadMs: 90 * 60 * 1000,
+
+  /**
+   * How long before the start registration closes and check-in opens.
+   *
+   * Ten minutes, which is both halves of one decision: it is how long a player
+   * has to confirm, and it is how much notice somebody gets that the thing
+   * they registered for is about to happen. Shorter and a player who put their
+   * phone down misses it; longer and the tournament spends a quarter of an
+   * hour asking a question nobody has changed their answer to.
+   */
+  checkInLeadMs: 10 * 60 * 1000,
+
+  /**
+   * How long the final countdown runs once the roster is sealed.
+   *
+   * Only reached by a deployment running with check-in off — a daily
+   * tournament starts at its published time, not fifteen seconds after a
+   * countdown somebody started. Kept because that deployment is still
+   * supported and the fast-start path still uses it.
+   */
+  startCountdownMs: 15 * 1000,
+
+  /**
+   * How long after registration opens before bots start filling empty seats.
+   *
+   * Unused while check-in is on: the roster cannot seal before check-in
+   * closes, so the seats are filled there, at the last moment that is still
+   * before the start. Kept for the fast-start path.
+   */
+  botFillDelayMs: 45 * 1000,
+
+  /**
+   * Whether registered players must confirm they are present before the
+   * bracket is drawn.
+   *
+   * ## On, and why that changed
+   *
+   * It was off while tournaments ran back to back on a two-minute window,
+   * because over two minutes nobody has gone anywhere and the question was
+   * itself the delay it was meant to prevent.
+   *
+   * A scheduled tournament is the opposite case. Registration for the evening
+   * one opens ninety minutes before it starts, and a bracket drawn from
+   * everybody who tapped join at half past six would be half walkovers. So the
+   * last ten minutes ask, and the answer decides who is seeded.
+   */
+  checkInEnabled: true,
 
   /**
    * How long a match room waits for its humans before it starts anyway.
@@ -250,19 +460,26 @@ export const AUTO_TOURNAMENT_LIMITS = {
 /**
  * How often the scheduler wakes, and how long it may hold the lock.
  *
- * The tick is short because the things it watches are deadlines measured in
- * minutes: a fifteen-second tick means a registration window closes within
- * fifteen seconds of when it said it would, which nobody notices, while a
- * sixty-second tick is visible on a two-minute check-in.
+ * ## Why the tick is five seconds
+ *
+ * Because the tick is the error bar on every deadline in the system, and the
+ * shortest of them are not the daily ones. A tournament's start time is known
+ * hours in advance and nobody notices it beginning three seconds late — but a
+ * match entry deadline is ninety seconds, a bot fill is a moment, and a round
+ * that has finished should open the next one while the players are still
+ * looking at the screen.
+ *
+ * Five seconds keeps all of those inside a rounding error. The cost is a
+ * handful of indexed queries over at most six tournaments — today's three and
+ * tomorrow's — which is nothing.
  *
  * The lease is far longer than a tick takes, because its job is not to bound
  * the work — it is to release a lock held by a process that died mid-tick. Too
  * short and a slow tick would run beside its own replacement; too long and a
- * crash would stall every tournament until it expired. Ninety seconds is
- * roughly six ticks of headroom.
+ * crash would stall every tournament until it expired.
  */
 export const SCHEDULER_TIMING = {
-  tickMs: 15 * 1000,
+  tickMs: 5 * 1000,
   lockLeaseMs: 90 * 1000,
   /** The lock every scheduler run contends for. One row, one key. */
   lockKey: 'tournament:scheduler',

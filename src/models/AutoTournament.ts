@@ -7,10 +7,10 @@ import {
   AUTO_TOURNAMENT_STATUS,
   BOT_DIFFICULTY,
   CREATED_BY_TYPE,
+  DAILY_SLOT,
   PLAYER_TYPE,
   REGISTRATION_STATUS,
-  SLOT_HOLDING_STATUSES,
-  TOURNAMENT_SLOT_COUNT,
+  TOURNAMENTS_PER_DAY,
 } from '@/constants/autoTournament.constants';
 
 /**
@@ -28,40 +28,64 @@ import {
  * Both collections are live at once and the REST layer resolves an id against
  * this one first. Nothing about the points feature changes.
  *
- * ## The slot invariant
+ * ## The daily invariant
  *
- * "Exactly three tournaments, never four" is enforced by the partial unique
- * index on `slotNumber` below, restricted to the statuses that hold a slot.
- * That makes a duplicate a *write failure* rather than something a scheduler
- * has to notice: two processes racing to fill slot 2 both insert, one wins,
- * the loser gets a duplicate-key error and moves on. No count is read, so
- * there is no window between reading it and acting on it.
+ * "Exactly three tournaments a day, never four" is enforced by the unique
+ * index on `{tournamentDate, dailySlot, isAutomatic}` below. That makes a
+ * duplicate a *write failure* rather than something a scheduler has to notice:
+ * two processes racing to create this evening's tournament both insert, one
+ * wins, the loser gets a duplicate-key error and moves on. No count is read,
+ * so there is no window between reading it and acting on it.
+ *
+ * The constraint holds for every status, which is the difference from the
+ * rolling model it replaced. A completed morning tournament still owns
+ * `{2026-09-16, MORNING}` for ever, so nothing can be created in its place —
+ * and nothing should be, because the afternoon one was always going to happen
+ * on its own.
  */
 
 const autoTournamentSchema = new Schema(
   {
     /**
-     * Which of the three slots this tournament occupies.
+     * The calendar day this tournament belongs to, as `YYYY-MM-DD`.
      *
-     * The unique index below is on this field, so it is also the concurrency
-     * control: a slot holds one unfinished tournament and the database says so.
+     * In the deployment's configured timezone, not UTC and not the host's —
+     * see `utils/dayKey.ts` for why a string rather than a `Date`. Half of the
+     * identity of a tournament, and half of the unique index.
+     */
+    tournamentDate: {
+      type: String,
+      required: true,
+      match: /^\d{4}-\d{2}-\d{2}$/,
+    },
+
+    /**
+     * Which of the day's three tournaments this is.
+     *
+     * The other half of the identity. Named rather than timed so that moving
+     * the evening tournament by an hour is a configuration change and every
+     * row already stamped `EVENING` stays correct.
+     */
+    dailySlot: {
+      type: String,
+      enum: Object.values(DAILY_SLOT),
+      required: true,
+    },
+
+    /**
+     * The slot's position in the day, 1 to 3.
+     *
+     * Denormalised from `dailySlot` purely so the listing sorts in the
+     * database: Mongo cannot order by a hand-written sequence of strings, and
+     * MORNING, AFTERNOON, EVENING is not alphabetical. Never written by hand —
+     * see `DAILY_SLOT_ORDER`.
      */
     slotNumber: {
       type: Number,
       required: true,
       min: 1,
-      max: TOURNAMENT_SLOT_COUNT,
+      max: TOURNAMENTS_PER_DAY,
     },
-
-    /**
-     * A monotonically increasing number across every tournament ever created,
-     * used to build the public name.
-     *
-     * Global rather than per slot so two tournaments never share a display
-     * name — "Daily Scribble Cup #7" refers to one event for all time, which is
-     * what makes a result announcement mean something afterwards.
-     */
-    tournamentNumber: { type: Number, required: true },
 
     name: { type: String, required: true, trim: true, maxlength: AUTO_TOURNAMENT_LIMITS.maxNameLength },
     description: {
@@ -120,9 +144,31 @@ const autoTournamentSchema = new Schema(
     /** The lifecycle deadlines the scheduler acts on. */
     registrationOpenAt: { type: Date, required: true },
     registrationCloseAt: { type: Date, required: true },
+    /**
+     * When bots may begin taking the empty seats.
+     *
+     * Stored on the row rather than derived from `registrationOpenAt` plus the
+     * current configuration, for the same reason every other rule here is
+     * copied onto the row: a tournament people are already sitting in keeps
+     * the timings it advertised when they joined.
+     *
+     * Optional in the schema so a row written before this field existed still
+     * loads. `openRegistration` sets it on every tournament it opens, and the
+     * scheduler treats a missing value as "fill immediately", which is the
+     * safe reading for a row that has been waiting through a deploy.
+     */
+    botFillAt: { type: Date, default: null },
+    /**
+     * When the start countdown ends, or null outside `STARTING`.
+     *
+     * Cleared when a tournament leaves the phase, so the field answers "is a
+     * countdown running, and until when" on its own rather than only in
+     * combination with the status.
+     */
+    countdownEndsAt: { type: Date, default: null },
     checkInOpenAt: { type: Date, required: true },
     checkInCloseAt: { type: Date, required: true },
-    /** When play begins. Equal to `checkInCloseAt` unless a start is delayed. */
+    /** When play begins. Rewritten to the real moment as the bracket is drawn. */
     startAt: { type: Date, required: true },
 
     /** How many bracket rounds this tournament has, once seeded. Zero before. */
@@ -139,6 +185,64 @@ const autoTournamentSchema = new Schema(
       ref: 'TournamentRegistration',
       default: null,
     },
+
+    /**
+     * The winner, copied out at the moment they won.
+     *
+     * ## Why a snapshot and not a join
+     *
+     * Because a result is a historical fact and a profile is not. Somebody who
+     * wins Ink Royale on Tuesday and renames themselves on Thursday did not
+     * retroactively win it under the new name — and a results card that
+     * re-read the profile would say they did, silently rewriting every
+     * tournament they have ever been in.
+     *
+     * So the name, the avatar and the user id are written once, here, and
+     * every reader shows what was written. `winnerRegistrationId` still points
+     * at the live row for anything that needs the current person; these
+     * fields are what the card draws.
+     *
+     * `winnerUserId` is null when a bot won, which is a thing that can happen
+     * and has to be able to be told apart from "not finished yet" —
+     * `completedAt` is what answers that.
+     */
+    winnerUserId: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    winnerDisplayName: { type: String, default: null },
+    winnerAvatarId: { type: Number, default: null },
+    winnerAvatarColorIndex: { type: Number, default: null },
+    winnerIsBot: { type: Boolean, default: false },
+
+    /**
+     * The final placement table, frozen at completion.
+     *
+     * Same reasoning as the winner snapshot, applied to everybody else: a
+     * player who came third is third for ever under the name they played
+     * under. Stored on the tournament rather than assembled from registration
+     * rows on every read, so a finished tournament's result is one document
+     * and cannot drift as those rows are edited.
+     *
+     * Empty until the final is decided. A tournament that was cancelled never
+     * gets one, because it has no result to freeze.
+     */
+    finalRankings: {
+      type: [
+        new Schema(
+          {
+            registrationId: { type: Schema.Types.ObjectId, required: true },
+            userId: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+            displayName: { type: String, required: true },
+            avatarId: { type: Number, default: 0 },
+            avatarColorIndex: { type: Number, default: 0 },
+            isBot: { type: Boolean, default: false },
+            placement: { type: Number, required: true, min: 1 },
+            eliminatedInRound: { type: Number, default: null },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
     completedAt: { type: Date, default: null },
     /** Why a cancelled tournament was cancelled, for the listing to explain. */
     cancelReason: { type: String, default: null },
@@ -161,32 +265,50 @@ const autoTournamentSchema = new Schema(
 );
 
 /**
- * One unfinished tournament per slot. The whole "never a fourth" rule.
+ * One tournament per slot per day. The whole "never a fourth" rule.
  *
- * Partial rather than plain unique: a slot is reused for ever, so a plain
- * index would reserve it against every tournament that ever ran in it. Only
- * the statuses in `SLOT_HOLDING_STATUSES` constrain, which is exactly the set
- * that occupies a slot.
+ * ## Why this one is not partial
+ *
+ * Because a daily slot is never reused. `{2026-09-16, MORNING}` names one
+ * event for all time, so the constraint should hold for all time — including
+ * after it has finished, which is precisely when a scheduler that had lost
+ * track might try to create "today's morning tournament" a second time.
+ *
+ * That is the opposite of the index this replaced, which had to be restricted
+ * to live statuses because a rolling slot came free the moment its occupant
+ * ended. Under the daily model nothing comes free, and an unrestricted unique
+ * index is both simpler and stricter.
+ *
+ * `isAutomatic` is in the key because the product rule is about *automatic*
+ * tournaments. Nothing else creates one today — there is no route that could —
+ * so in practice the key is the date and the slot.
+ *
+ * **This index replaces `one_live_tournament_per_slot`, which must be
+ * dropped.** `npm run sync-indexes` does both.
  */
 autoTournamentSchema.index(
-  { slotNumber: 1 },
-  {
-    unique: true,
-    name: 'one_live_tournament_per_slot',
-    partialFilterExpression: { status: { $in: [...SLOT_HOLDING_STATUSES] } },
-  },
+  { tournamentDate: 1, dailySlot: 1, isAutomatic: 1 },
+  { unique: true, name: 'one_tournament_per_slot_per_day' },
 );
 
-/** The display number is unique for all time, so a name names one event. */
-autoTournamentSchema.index({ tournamentNumber: 1 }, { unique: true });
-
-/** The scheduler's own sweep: everything still holding a slot, by deadline. */
+/** The scheduler's own sweep: everything unfinished, by deadline. */
+autoTournamentSchema.index({ status: 1, registrationOpenAt: 1 });
 autoTournamentSchema.index({ status: 1, registrationCloseAt: 1 });
 autoTournamentSchema.index({ status: 1, checkInCloseAt: 1 });
 autoTournamentSchema.index({ status: 1, startAt: 1 });
+/** The two fast-start deadlines, for the same sweep. */
+autoTournamentSchema.index({ status: 1, botFillAt: 1 });
+autoTournamentSchema.index({ status: 1, countdownEndsAt: 1 });
 
-/** The listing: the three slots, newest tournament per slot first. */
-autoTournamentSchema.index({ isAutomatic: 1, status: 1, slotNumber: 1 });
+/**
+ * The listing: one day's tournaments, in the order they happen.
+ *
+ * The most-read query in the feature — it is what the tournament screen asks
+ * for — and it is fully covered by this index, including the sort, so drawing
+ * three cards never scans.
+ */
+autoTournamentSchema.index({ tournamentDate: 1, slotNumber: 1 });
+autoTournamentSchema.index({ isAutomatic: 1, tournamentDate: 1, status: 1 });
 autoTournamentSchema.index({ startAt: 1 });
 
 /**
@@ -254,6 +376,15 @@ const tournamentRegistrationSchema = new Schema(
     checkedInAt: { type: Date, default: null },
     /** Which round they went out in, for the results table. */
     eliminatedInRound: { type: Number, default: null },
+    /**
+     * Why they went out, when it was not simply losing.
+     *
+     * Only `'disconnected'` is written today, by the stand-in service. It is a
+     * string rather than a boolean because the results table shows it to the
+     * player, and "you were disconnected" is a different sentence from "you
+     * lost" — conflating the two makes the tournament look like it cheated.
+     */
+    eliminatedReason: { type: String, default: null },
   },
   { timestamps: true, collection: 'tournament_registrations' },
 );
@@ -300,13 +431,20 @@ tournamentRegistrationSchema.index(
 tournamentRegistrationSchema.index({ tournamentId: 1, playerType: 1, status: 1 });
 
 /**
- * "Is this user already in a live tournament?"
+ * "Which of today's tournaments is this user in?"
  *
- * Asked on every registration attempt and on every tournament listing, against
- * a filter of the user plus a status set. The user leads because it is the
- * selective half.
+ * Asked once per listing, for a set of tournament ids at a time rather than
+ * one at a time — a player may hold a place in all three of a day's
+ * tournaments, so this is a per-row answer and the listing would otherwise be
+ * a query per card.
+ *
+ * The user leads because it is the selective half. It also answers "is this
+ * user in a match right now", which is the one remaining cross-tournament
+ * rule: registrations are unlimited, but two matches at the same moment are
+ * not.
  */
 tournamentRegistrationSchema.index({ userId: 1, status: 1 });
+tournamentRegistrationSchema.index({ userId: 1, tournamentId: 1 });
 
 /** The bracket read: one tournament's roster in seed order. */
 tournamentRegistrationSchema.index({ tournamentId: 1, seed: 1 });

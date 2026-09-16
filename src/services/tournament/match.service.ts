@@ -16,7 +16,8 @@ import { TournamentMatch, type TournamentMatchDocument } from '@/models/Tourname
 import { botProfileService } from '@/services/bot/botProfile.service';
 import { chatService } from '@/services/chat.service';
 import { defaultSettings, roomService } from '@/services/room.service';
-import { announceToPlayer, announceTournament } from '@/services/tournament/notify';
+import { announceToPlayer, announceTournament, tournamentRef } from '@/services/tournament/notify';
+import { tournamentStandInService } from '@/services/tournament/standIn.service';
 import type { PlayerScoreDto } from '@/types/game.types';
 import type { RoomSettingsDto } from '@/types/room.types';
 import type { RuntimeRoom } from '@/types/socket.types';
@@ -443,12 +444,18 @@ export class TournamentMatchService {
     const first = ranked[0];
     const second = ranked[1];
 
-    const winnerRegistrationId = first
-      ? binding.registrationIdByPlayerId[first.playerId]
-      : undefined;
-    const loserRegistrationId = second
-      ? binding.registrationIdByPlayerId[second.playerId]
-      : undefined;
+    // A seat that was taken over by a stand-in bot decides the match on its
+    // own, whatever the scoreboard says: the bot played properly, its score is
+    // recorded, and the round still goes to the player who stayed. See
+    // `standIn.service.ts` for why a stand-in may never advance a bracket.
+    const forfeit = await tournamentStandInService.winnerByForfeit(binding.matchId);
+
+    const winnerRegistrationId =
+      forfeit?.winnerRegistrationId ??
+      (first ? binding.registrationIdByPlayerId[first.playerId] : undefined);
+    const loserRegistrationId =
+      forfeit?.loserRegistrationId ??
+      (second ? binding.registrationIdByPlayerId[second.playerId] : undefined);
 
     if (!winnerRegistrationId) {
       logger.error('a tournament match ended with no identifiable winner', {
@@ -760,11 +767,76 @@ export class TournamentMatchService {
       throw errors.invalidAction('That match has not opened yet.');
     }
 
+    await this.refuseIfAlreadyPlaying(input.userId, input.tournamentId);
+
     return {
       roomId: String(match.roomId),
       roomCode: match.roomCode,
       match: match as TournamentMatchDocument,
     };
+  }
+
+  /**
+   * Refuses entry when this player is already in a match somewhere else.
+   *
+   * ## The one cross-tournament rule left
+   *
+   * Registration is per tournament and unlimited — a player may hold a place
+   * in all three of a day's tournaments and that is the point of having three.
+   * But the game engine seats one player in one room: a person in two live
+   * matches at the same instant would be drawing for one of them and absent
+   * from the other, and the other would be decided against them by its entry
+   * deadline while they were busy.
+   *
+   * So the limit is applied at the door of the *match* rather than at the door
+   * of the tournament, which is both the narrowest place it can go and the
+   * last moment the answer is certain. Under the published schedule this
+   * almost never fires: the slots are hours apart. It fires when a bracket
+   * over-runs into the next one, which is exactly the case nothing else
+   * catches.
+   *
+   * The refusal names the other tournament, because "you are already playing"
+   * is baffling to somebody who has forgotten they joined two.
+   */
+  private async refuseIfAlreadyPlaying(
+    userId: string,
+    tournamentId: string,
+  ): Promise<void> {
+    const seats = await TournamentRegistration.find({
+      userId,
+      tournamentId: { $ne: tournamentId },
+      status: REGISTRATION_STATUS.active,
+    })
+      .select({ _id: 1, tournamentId: 1 })
+      .lean()
+      .exec();
+
+    if (seats.length === 0) return;
+
+    const elsewhere = await TournamentMatch.findOne({
+      tournamentId: { $in: seats.map((seat) => seat.tournamentId) },
+      status: MATCH_STATUS.running,
+      $or: [
+        { slotA: { $in: seats.map((seat) => seat._id) } },
+        { slotB: { $in: seats.map((seat) => seat._id) } },
+      ],
+    })
+      .select({ tournamentId: 1 })
+      .lean()
+      .exec();
+
+    if (!elsewhere) return;
+
+    const other = await AutoTournament.findById(elsewhere.tournamentId)
+      .select({ name: 1 })
+      .lean()
+      .exec();
+
+    throw errors.invalidAction(
+      other
+        ? `You are already playing a match in ${other.name}. Finish it first.`
+        : 'You are already playing a match in another tournament. Finish it first.',
+    );
   }
 
   // ----------------------------------------------------------------- rounds
@@ -883,19 +955,9 @@ export class TournamentMatchService {
       ? String(final.winnerRegistrationId)
       : null;
 
-    const closed = await AutoTournament.updateOne(
-      { _id: tournamentId, status: AUTO_TOURNAMENT_STATUS.running },
-      {
-        $set: {
-          status: AUTO_TOURNAMENT_STATUS.completed,
-          winnerRegistrationId,
-          completedAt: new Date(),
-        },
-      },
-    ).exec();
-
-    if ((closed.modifiedCount ?? 0) === 0) return;
-
+    // Marked before the tournament is closed, so the snapshot built below
+    // reads a roster in which the winner is already the winner. The write is
+    // idempotent and harmless if the close then loses its race.
     if (winnerRegistrationId) {
       await TournamentRegistration.updateOne(
         { _id: winnerRegistrationId },
@@ -907,12 +969,66 @@ export class TournamentMatchService {
       ? await this.registration(winnerRegistrationId)
       : null;
 
+    const rankings = await this.finalRankings(tournamentId);
+
+    // Everything the result will ever say, written in one conditional update.
+    //
+    // ## Why the names are copied here rather than joined at read time
+    //
+    // Because this is the last moment they are certainly true. A player who
+    // wins tonight and renames themselves next week did not win under the new
+    // name, and a card that re-read their profile would say they did —
+    // silently rewriting every result they have ever been part of. Copying
+    // costs a few hundred bytes per tournament and makes the record a record.
+    //
+    // ## Why one update and not several
+    //
+    // The filter names the status it expects to replace, so of two schedulers
+    // reaching the final together exactly one writes — and it writes the
+    // winner, the snapshot and the rankings together. Split across writes, the
+    // loser of that race could land its half on top of the winner's.
+    const closed = await AutoTournament.updateOne(
+      { _id: tournamentId, status: AUTO_TOURNAMENT_STATUS.running },
+      {
+        $set: {
+          status: AUTO_TOURNAMENT_STATUS.completed,
+          winnerRegistrationId,
+          winnerUserId: winner?.userId ?? null,
+          winnerDisplayName: winner?.displayName ?? null,
+          winnerAvatarId: winner?.avatarId ?? null,
+          winnerAvatarColorIndex: winner?.avatarColorIndex ?? null,
+          winnerIsBot: Boolean(winner?.isBot),
+          finalRankings: rankings,
+          completedAt: new Date(),
+        },
+      },
+    ).exec();
+
+    // Somebody else closed it. Not an error, and specifically not a reason to
+    // announce a second winner for the same tournament — which is what the
+    // duplicate-result case would otherwise produce.
+    if ((closed.modifiedCount ?? 0) === 0) return;
+
+    const tournament = await AutoTournament.findById(tournamentId)
+      .select({ tournamentDate: 1, dailySlot: 1, slotNumber: 1, name: 1, completedAt: 1 })
+      .lean()
+      .exec();
+
     announceTournament('completed', {
-      tournamentId,
+      ...(tournament
+        ? tournamentRef(tournament, AUTO_TOURNAMENT_STATUS.completed)
+        : { tournamentId, status: AUTO_TOURNAMENT_STATUS.completed }),
+      completedAtMs: tournament?.completedAt ? tournament.completedAt.getTime() : Date.now(),
+      // This tournament's winner, on this tournament's event. A client that
+      // keys on `tournamentId` — which every one of these events carries —
+      // cannot paint it onto another card.
       winner: winner
         ? {
             registrationId: String(winner._id),
+            userId: winner.userId ? String(winner.userId) : null,
             displayName: winner.displayName,
+            avatarId: winner.avatarId ?? 0,
+            avatarColorIndex: winner.avatarColorIndex ?? 0,
             isBot: Boolean(winner.isBot),
           }
         : null,
@@ -922,7 +1038,68 @@ export class TournamentMatchService {
       tournamentId,
       winnerRegistrationId,
       winnerIsBot: Boolean(winner?.isBot),
+      ranked: rankings.length,
     });
+  }
+
+  /**
+   * The placement table, as it stands at the moment the final is decided.
+   *
+   * A knockout has no running score, so placement is *depth*: the winner,
+   * then whoever lost the final, then the losing semi-finalists, and so on.
+   * Ties are broken by seed, which makes the order stable rather than
+   * whatever the database happened to return.
+   *
+   * Withdrawn and no-show rows are left out. They are part of the
+   * tournament's history but not of its result, and a results table with
+   * somebody in it who never played reads as a mistake.
+   */
+  private async finalRankings(tournamentId: string): Promise<
+    {
+      registrationId: unknown;
+      userId: unknown;
+      displayName: string;
+      avatarId: number;
+      avatarColorIndex: number;
+      isBot: boolean;
+      placement: number;
+      eliminatedInRound: number | null;
+    }[]
+  > {
+    const rows = (await TournamentRegistration.find({
+      tournamentId,
+      status: {
+        $in: [
+          REGISTRATION_STATUS.winner,
+          REGISTRATION_STATUS.eliminated,
+          REGISTRATION_STATUS.active,
+        ],
+      },
+    })
+      .lean()
+      .exec()) as TournamentRegistrationDocument[];
+
+    const depth = (entry: TournamentRegistrationDocument): number =>
+      entry.status === REGISTRATION_STATUS.winner
+        ? Number.MAX_SAFE_INTEGER
+        : (entry.eliminatedInRound ?? 0);
+
+    return [...rows]
+      .sort((a, b) => {
+        const difference = depth(b) - depth(a);
+        if (difference !== 0) return difference;
+        return (a.seed ?? 999) - (b.seed ?? 999);
+      })
+      .map((entry, index) => ({
+        registrationId: entry._id,
+        userId: entry.userId ?? null,
+        displayName: entry.displayName,
+        avatarId: entry.avatarId ?? 0,
+        avatarColorIndex: entry.avatarColorIndex ?? 0,
+        isBot: Boolean(entry.isBot),
+        placement: index + 1,
+        eliminatedInRound: entry.eliminatedInRound ?? null,
+      }));
   }
 
   /** One registration row, or null. */

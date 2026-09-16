@@ -104,6 +104,30 @@ const tournamentMatchSchema = new Schema(
       ref: 'TournamentRegistration',
       default: null,
     },
+
+    /**
+     * A seat whose player left and was taken over by a bot.
+     *
+     * ## Why the result is decided here rather than by the scoreboard
+     *
+     * A stand-in bot exists so the *other* player gets a real game instead of
+     * a frozen canvas — that is the whole reason the match carries on. It is
+     * not a bracket entrant, and letting it advance on points would mean a
+     * human knocked out of a tournament by a robot that replaced their
+     * opponent, which is a worse outcome than the walkover it was meant to
+     * improve on.
+     *
+     * So the bot plays to win and its score is recorded honestly, and this
+     * field is what `onMatchGameEnded` reads to hand the round to the player
+     * who stayed, whatever the scoreboard says.
+     *
+     * Null on every ordinary match, which is almost all of them.
+     */
+    forfeitedRegistrationId: {
+      type: Schema.Types.ObjectId,
+      ref: 'TournamentRegistration',
+      default: null,
+    },
     outcome: {
       type: String,
       enum: [...Object.values(MATCH_OUTCOME), null],

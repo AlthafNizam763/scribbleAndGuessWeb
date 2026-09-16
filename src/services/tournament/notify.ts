@@ -37,6 +37,42 @@ import { logger } from '@/utils/logger';
  * these events are how a client avoids polling, not how it learns the truth.
  */
 
+/**
+ * The identity block every tournament event carries.
+ *
+ * ## Why this is a function and not three fields typed out fifteen times
+ *
+ * Because a client receiving `tournament:registration_updated` has to know
+ * *which* tournament changed, and on a screen showing three cards for today
+ * the answer is not obvious from anything else in the payload. An event that
+ * omitted it would update the wrong card or, more likely, force a re-read of
+ * the whole listing — which is the polling this channel exists to avoid.
+ *
+ * The status is passed separately rather than read off the row, because at
+ * almost every call site the row in hand is the *old* one: the update that
+ * moved it has already run, and the document was loaded before that. Taking
+ * `row.status` would announce every transition as the state it just left.
+ */
+export function tournamentRef(
+  row: {
+    _id: unknown;
+    tournamentDate?: string;
+    dailySlot?: string;
+    slotNumber?: number;
+    name?: string;
+  },
+  status: string,
+): Record<string, unknown> {
+  return {
+    tournamentId: String(row._id),
+    tournamentDate: row.tournamentDate,
+    dailySlot: row.dailySlot,
+    slotNumber: row.slotNumber,
+    name: row.name,
+    status,
+  };
+}
+
 /** Fans one event out to everybody watching the tournament listing. */
 export function announceTournament(
   event: TournamentEventName,

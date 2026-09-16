@@ -7,27 +7,33 @@ import { autoTournamentService } from '@/services/tournament/auto.service';
 /**
  * `GET /api/tournaments`
  *
- * The automatic tournament slots — three of them, in order.
+ * Today's tournaments — at most three, in the order they happen.
  *
- * ## Why a slot with nothing in it is still a row
+ * ## Why "at most" and not "exactly"
  *
- * Because the screen shows three cards and "no tournament in this slot; a new
- * one will be created automatically soon" is a card. Returning only the
- * tournaments that exist would make the client work out which slots are
- * missing, which is the server's arithmetic, not the client's.
+ * Three is what a normal day has, and the unique index on
+ * `{tournamentDate, dailySlot, isAutomatic}` is what stops there ever being a
+ * fourth. But a day can honestly have fewer: a deployment that first booted
+ * this afternoon never created a morning tournament, because a tournament
+ * whose registration window closed before it existed is one nobody could have
+ * joined. Returning two cards that day is the truth; inventing a third would
+ * not be.
+ *
+ * ## Why finished tournaments are included
+ *
+ * Because the morning tournament's result is the most interesting thing on
+ * this screen at lunchtime, and because the player who won it should be able
+ * to find it. A day is a schedule, not a queue — nothing is removed from it
+ * when it ends.
  *
  * ## Why authentication is optional
  *
- * The listing is public: what is on, how full it is and when it starts are the
- * same facts for everybody. Signing in adds the `viewer` block — whether you
- * are registered, whether you may check in, and why you cannot join if you
- * cannot — which is the only per-caller part of the response.
- *
- * ## Where the older points tournaments went
- *
- * `GET /api/tournaments/events`. They are a separate feature with separate
- * rows, and this path now belongs to the automatic system, which is the one a
- * player means when they open the tournament screen.
+ * The schedule is public: what is on, when, how full it is and who won are the
+ * same facts for everybody. Signing in adds the `viewer` block on each row —
+ * whether *you* are registered for that one, whether you may check in, which
+ * match is waiting for you — which is the only per-caller part of the
+ * response, and is computed per tournament because a player may be in more
+ * than one of them.
  */
 export const GET = withErrorHandling(async (request: Request) => {
   const user = await optionalUser(request);
@@ -35,7 +41,7 @@ export const GET = withErrorHandling(async (request: Request) => {
 
   await connectToDatabase();
 
-  return ok(await autoTournamentService.listSlots(user?.id ?? null));
+  return ok(await autoTournamentService.listToday(user?.id ?? null));
 });
 
 export const dynamic = 'force-dynamic';

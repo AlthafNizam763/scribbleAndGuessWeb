@@ -1,8 +1,10 @@
-# Automatic tournaments, with AI players
+# Daily tournaments, with AI players
 
-Three knockout tournaments run at all times. Nobody creates them, nobody
-administers them, and nobody fills them — the server does all three. A player's
-entire vocabulary is **join**, **check in**, and **enter my match**.
+Three tournaments every day — morning, afternoon and evening. Nobody creates
+them, nobody administers them, and nobody fills them: the server publishes the
+schedule, seats AI players where a roster is short, draws the bracket and
+decides the matches. A player's whole vocabulary is **join**, **check in** and
+**enter my match**.
 
 When a tournament is short of players, the server seats AI bots that play the
 real game: they pick a word, draw it stroke by stroke over the existing drawing
@@ -14,17 +16,27 @@ scoring rules, win, lose, and advance through the bracket.
 ## 1. The shape of it
 
 ```
-  scheduler tick (every 15s, or an external cron)
+  day rolls over (in TOURNAMENT_TIMEZONE)
         │
-        ├─ fill vacant slots ─────────► AutoTournament (UPCOMING)
-        ├─ open registration ─────────► REGISTRATION   ── players join
-        ├─ registration deadline ─────► CHECK_IN       ── players confirm
-        ├─ check-in deadline ─────────► bot fill → bracket → RUNNING
-        ├─ match entry deadlines ─────► walkovers
-        └─ round progression ─────────► COMPLETED / CANCELLED → slot released
-                                                                   │
-                                                    next tick refills the slot
+        └─ the organiser publishes today and tomorrow ── 3 per day, UPCOMING
+                │
+                │  (hours pass; the card shows a start time)
+                │
+   startAt-90m ─┼─► REGISTRATION ── players join; any of the day's three
+                │
+   startAt-10m ─┼─► CHECK_IN ────── registered players confirm they are here
+                │
+   startAt ─────┼─► no-shows out, bots take the empty seats, bracket drawn
+                │
+                └─► RUNNING ──► COMPLETED   (or CANCELLED, if nobody came)
+                                   │
+                                   └─ the card stays, showing the winner
 ```
+
+Nothing is created to replace a tournament that ends. A daily slot is a date
+and a time of day; when the morning tournament finishes, the morning is over.
+The next tournament is the afternoon one, which has been on the schedule since
+midnight.
 
 A match is an **ordinary room**:
 
@@ -43,160 +55,194 @@ game. A tournament result is whatever `gameService.endGame` computed.
 
 ---
 
-## 2. The three-slot rule
+## 2. "Three a day, never four"
 
-"Exactly three tournaments, never four" is **a unique index**, not a count:
+It is **a unique index**, not a count:
 
 ```js
 // models/AutoTournament.ts
 autoTournamentSchema.index(
-  { slotNumber: 1 },
-  { unique: true,
-    partialFilterExpression: { status: { $in: ['UPCOMING','REGISTRATION','CHECK_IN','RUNNING'] } } },
+  { tournamentDate: 1, dailySlot: 1, isAutomatic: 1 },
+  { unique: true, name: 'one_tournament_per_slot_per_day' },
 );
 ```
 
-Two schedulers racing to fill slot 2 both insert; one wins, the other gets a
-duplicate-key error and moves on. There is no read-then-write, so there is no
-window. The partial filter is what lets a slot be reused for ever without the
-index reserving it against every tournament that ever ran in it.
+Two schedulers racing to publish this evening's tournament both insert; one
+wins, the other gets a duplicate-key error, logs it as the ordinary event it is,
+and moves on. There is no read-then-write anywhere in `dailyPlanner.service.ts`,
+so there is no window. Every one of these is the same case and needs no special
+handling:
 
-`tournamentNumber` is separately unique for all time, so "Daily Scribble Cup #7"
-names one event even though slot 2 has held dozens.
+| Situation | What happens |
+|---|---|
+| Two cron requests arrive together | One insert wins, the other is refused |
+| The server restarts | The next tick finds the day already published |
+| A scheduler retries | Same |
+| Several Render instances run | Same |
+| The scheduler endpoint is called in a loop | Same |
+| A tournament completes | Nothing is created; the slot is spent |
+| A tournament is cancelled | Nothing is created; the slot is spent |
+
+The constraint is **not** restricted to live statuses — that was the rolling
+model's index, which had to be, because a slot came free the moment its occupant
+ended. `{2026-09-16, MORNING}` names one event for all time.
+
+> **Deploying this over the rolling version drops `one_live_tournament_per_slot`
+> and builds the new index.** `npm run sync-indexes` does both. See §8.
+
+### The day, and which one it is
+
+A day is a `'YYYY-MM-DD'` string computed in `TOURNAMENT_TIMEZONE`, not a
+`Date` and not the host's clock — see `utils/dayKey.ts`. Every instance asking
+on the same wall-clock day gets the same ten characters, which is what makes the
+index a constraint rather than a hope. It also sorts: chronological order is
+lexicographic order, so "today's tournaments" is one indexed query.
+
+### A slot that has already passed is not created
+
+A deployment that first boots at nine in the evening does not publish that
+morning's tournament. It could never have been joined, and creating it would
+produce a card that exists only to be cancelled. That day has two tournaments,
+or one; the next has three.
 
 ---
 
-## 3. When AI players are added
+## 3. The names
 
-Decided by `TournamentBotFillService.plan`, at **check-in close** — not at
-registration close, because the number that matters is how many people are
-actually present.
+Twenty names, three a day, from `TOURNAMENT_NAME_POOL`:
 
-| Humans present | Bots added | Outcome |
-|---|---|---|
-| 4 | 0 | 4 humans play |
-| 3 | 1 | 4 players |
-| 2 | 2 | 4 players |
-| 1 | 3 | 4 players |
-| 0 | — | **cancelled** |
-| 6 | 0 | 6 humans play (no top-up) |
-| 2, `maxBots=0` | — | cancelled |
+> Ink Royale · Doodle Rush · Sketch Clash · Scribble Storm · Canvas Kings ·
+> Draw Duel · Pencil Panic · Sketch Masters · Ink Warriors · Doodle League ·
+> Brush Battle · The Drawing Cup · Sketch Legends · Paper Champions ·
+> The Scribble Cup · Creative Clash · Drawing Rivals · Masterpiece Match ·
+> Ink Arena · Ultimate Doodle Cup
 
-Two rules that fall out of this and are worth stating plainly:
+`TournamentNameService` picks them by **arithmetic on the date**, not by a
+counter, a shuffle or a draw. Day *n* takes pool positions `3n, 3n+1, 3n+2`
+(mod 20). That matters because two processes must be able to create the same
+tournament without talking to each other: a retry, a second instance and a
+restart all compute the same three names for the same day, for ever, with no
+state to keep.
 
-- **A bot-only tournament is impossible.** `minHumanPlayers` is checked before
-  any arithmetic, so no combination of bots routes around it.
-- **A maximum is a ceiling, not a quota.** Nothing fills a 16-player tournament
-  with 16 bots because it *can* hold 16. The target is always `minPlayers`.
+The rotation is what gives the guarantees rather than a runtime check:
+
+- **Three different names a day** — three consecutive positions.
+- **No name on two consecutive days** — the positions differ by 3, 4 or 5 and
+  each day's set is two wide, so they cannot overlap.
+- **Twenty days before a name returns** — 20 and 3 share no factor.
+
+A name is written once, at creation, and **no code path writes it again**. That
+is what makes "do not rename a tournament people have joined" a property rather
+than a rule somebody has to remember. A winner's name never appears in a
+tournament name; the winner is a separate field on the row.
 
 ---
 
-## 4. The AI players
+## 4. One player, more than one tournament
 
-Six fixed profiles (`Scribbler`, `Sketcher`, `Doodler`, `GuessMaster`,
-`Pixeler`, `QuickDrawer`), each with a stored row giving it a stable ObjectId to
-play under. Three difficulties change *rates*, never rules:
+**The rule that reversed.** The rolling system refused a second registration
+while a first was live, because tournaments ran back to back and being in two
+meant being called to two matches at the same moment.
 
-| | guess delay | guess accuracy | stroke interval | template completeness | hand jitter |
-|---|---|---|---|---|---|
-| EASY | 8–15 s | 0.35 | 260 ms | 70 % | 0.030 |
-| NORMAL | 4–10 s | 0.55 | 180 ms | 90 % | 0.018 |
-| HARD | 2–6 s | 0.78 | 120 ms | 100 % | 0.008 |
+Three tournaments hours apart are not that:
 
-### Drawing
+| | |
+|---|---|
+| Won the morning tournament | May join the afternoon and the evening |
+| Lost the morning tournament | Same |
+| Missed the morning entirely | May join the afternoon and the evening |
+| Joined the morning | Is **not** registered for the others — each is joined separately |
+| Joined the morning twice | One seat. The unique index makes the second a no-op |
 
-`botDrawer.service.ts` turns a hand-specified template into a **plan**: a list
-of `begin` / `append` / `end` steps with delays. `botPlayer.service.ts` runs the
-plan through `drawingService.begin/append` and the `s:draw:*` broadcasts — the
-same code a person's packets go through, so a bot's stroke is sanitised, stored
-and relayed identically. The plan is paced to finish with a quarter of the turn
-to spare, because a drawing still being drawn at the buzzer helped nobody.
+Registration is per tournament and unlimited. The only cross-tournament rule
+left is at the door of the **match**, not the tournament: `match.service.enter`
+refuses a player who is already in a `RUNNING` match elsewhere, because the game
+engine seats one player in one room. Under the published schedule that almost
+never fires — the slots are hours apart — and it exists for the case where a
+bracket over-runs into the next one.
 
-Templates exist for: apple, banana, orange, house, car, tree, cat, dog, book,
-phone, flower, boat, sun, moon, star, umbrella, bicycle, computer, chair, pizza.
-An unknown word draws a neutral fallback and logs the gap — **never** throws,
-never stalls the round.
+---
 
-### Guessing — and the rule that shapes it
+## 5. The winner, and where it is shown
 
-**The guessing code cannot reach the answer.** `botGuesser.service.ts` takes one
-input type:
+When the final is decided, `finish()` writes the result **onto the tournament**
+in one conditional update:
 
-```ts
-interface GuesserView {
-  maskedWord: string;      // `_ _ E _ _`
-  wordLength: number;
-  hintIndices: readonly number[];
-  strokes: readonly StrokeDto[];   // the shared board
-  progress: number;
-}
+```
+winnerRegistrationId, winnerUserId, winnerDisplayName,
+winnerAvatarId, winnerAvatarColorIndex, winnerIsBot,
+finalRankings[], completedAt
 ```
 
-That object is built by the same `serializeGameState(room, botId)` that fills a
-human guesser's `s:game:state`, and `word` is `null` in it because the bot is
-not the drawer. There is no argument, no import and no service call through
-which the answer could arrive.
+A snapshot, not a join. A player who wins tonight and renames themselves next
+week did not win under the new name — and a card that re-read their profile
+would say they did, silently rewriting every result they have ever been part
+of. `finalRankings` freezes the whole placement table for the same reason.
 
-So how does it ever guess right? The same two ways a person does:
+The update names the status it expects to replace, so a duplicate result, a
+retried sweep or two schedulers reaching the final together produce **one**
+winner and one `completedAt`.
 
-1. **The blanks.** Length and revealed letters exclude most of the pool exactly.
-2. **The drawing, coarsely.** Stroke count, ink colours, bounding box, vertical
-   balance and mean stroke length — all derived from the shared canvas — are
-   compared against the same statistics computed from the bot's own template
-   library. A drawing that is mostly yellow radiating lines looks unlike a
-   single dark outline. It is a deliberately weak signal, and it is why a HARD
-   bot beats an EASY one on the same masked word.
-
-`accuracy` is the chance one attempt is drawn from the best-matching candidates
-rather than from all of them. It is never a short-circuit to the answer.
-
-### Worker safety
-
-Every bot timer is registered in one map keyed by room. Cleared on turn end,
-match end and room close. Bounded globally by `maxConcurrentWorkers` (24) — a
-bot refused a slot simply does nothing that turn and is still in the match.
-Exposed as the `botWorkers` gauge on `/api/metrics`.
+Every tournament's winner is on its own document and its own DTO. There is no
+ambient "latest winner" anywhere in the codebase, so there is nothing for a
+card to leak: `tournament:completed` carries a `tournamentId`, and a client that
+keys on it cannot paint the morning's winner onto the afternoon's card.
 
 ---
 
-## 5. API
+## 6. API
 
 Every route is under `/api/tournaments`. Reads marked *public* work signed out;
 the `viewer` block is then the anonymous one.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/tournaments` | *public* — the three slots, in order. An empty slot is a row with `tournament: null`. |
+| GET | `/api/tournaments` | *public* — today's tournaments, at most three, in the order they happen. |
+| GET | `/api/tournaments/today` | *public* — the same, at a path that says so. `?date=YYYY-MM-DD` for another day. |
 | GET | `/api/tournaments/active` | *public* — tournaments being played. |
-| GET | `/api/tournaments/upcoming` | *public* — tournaments still joinable. |
-| GET | `/api/tournaments/:id` | *public* — one tournament. Falls through to the older points events when the id is one of those. |
-| POST | `/api/tournaments/:id/register` | Take a place. Duplicate = no-op. |
-| DELETE | `/api/tournaments/:id/register` | Withdraw. Registration window only. |
-| POST | `/api/tournaments/:id/check-in` | Confirm you are here. Check-in window only. |
+| GET | `/api/tournaments/upcoming` | *public* — scheduled, open or in check-in, across days, by start time. |
+| GET | `/api/tournaments/:id` | *public* — one tournament and its own result. Falls through to the older points events when the id is one of those. |
+| POST | `/api/tournaments/:id/register` | Take a place **in that tournament only**. Duplicate = no-op. |
+| DELETE | `/api/tournaments/:id/register` | Cancel a registration. Registration window only. |
+| POST | `/api/tournaments/:id/check-in` | Confirm you are here, for that tournament only. |
 | GET | `/api/tournaments/:id/participants` | *public* — everybody, AI flagged. |
-| GET | `/api/tournaments/:id/bracket` | *public* — the draw. Room codes only on your own matches. |
-| GET | `/api/tournaments/:id/leaderboard` | *public* — placement table. |
+| GET | `/api/tournaments/:id/bracket` | *public* — that tournament's draw. Room codes only on your own matches. |
+| GET | `/api/tournaments/:id/leaderboard` | *public* — that tournament's placement table; the frozen one once it has finished. |
 | POST | `/api/tournaments/:id/matches/:matchId/enter` | The room code for your match. Participants only. |
 | POST | `/api/internal/tournaments/scheduler` | One scheduler tick. Secret-gated. GET also accepted. |
-| GET | `/api/tournaments/events` | The older *points* tournaments (moved from `/api/tournaments`). |
+| GET | `/api/tournaments/events` | The older *points* tournaments. |
 
 **Not present, by design:** `POST /api/tournaments/create`,
-`POST /api/user/tournaments`, and anything that adds a bot, changes settings,
-edits a bracket or reports a result. Those are not gated — they do not exist.
+`POST /api/user/tournaments`, `POST /api/admin/tournaments`, and anything that
+adds a bot, changes settings, edits a bracket or reports a result. Those are not
+gated — they do not exist.
+
+The day listing is shaped as a day rather than a bare list:
+
+```jsonc
+{
+  "tournamentDate": "2026-09-16",
+  "timeZone": "Asia/Kolkata",     // what "20:00" on these rows means
+  "tournaments": [ /* ≤ 3, in slot order */ ]
+}
+```
 
 ### Refusals worth knowing
 
 | Situation | Status | Message |
 |---|---|---|
-| Already in another tournament | 409 | `You are already in Daily Scribble Cup #4. You can join another once it finishes.` |
+| Registration has not opened | 409 | `Registration for this tournament has not opened yet.` |
 | Registration closed | 409 | `Registration has closed for this tournament.` |
+| Already started | 409 | `This tournament has already started.` |
+| Finished | 409 | `This tournament has finished.` |
+| Cancelled | 409 | `This tournament was cancelled.` |
 | Tournament full | 409 | `That tournament is full.` |
 | Check-in not open yet | 409 | `Check-in has not opened yet.` |
+| Already playing elsewhere | 409 | `You are already playing a match in Ink Royale. Finish it first.` |
 | Not a participant of a match | 404 | `That match does not exist.` |
 | Scheduler without the secret | 401 | `Not authorised.` |
 
-The listing pre-computes the first of these into
-`viewer.blockedReason`, so the UI can explain it *before* somebody taps.
+There is no longer a "you are already in another tournament" refusal.
 
 ### The `viewer` block
 
@@ -212,13 +258,18 @@ The listing pre-computes the first of these into
 }
 ```
 
-Computed server-side because the rules behind it are server rules. A client that
+Per tournament, because a player may be in more than one of them. Computed
+server-side because the rules behind it are server rules — a client that
 re-derived them would be a second implementation that could disagree, and the
 disagreement would look like a button that does nothing.
 
+`phaseEndsAtMs` is the one clock a card should render, and the server picks
+which: registration opening while `UPCOMING`, registration closing while
+`REGISTRATION`, the published start while in `CHECK_IN`.
+
 ---
 
-## 6. Socket events
+## 7. Socket events
 
 All under two names — `s:tournament:x` and the flatter `tournament:x` — so a
 client written against either vocabulary works.
@@ -228,12 +279,17 @@ per *connection* and does not survive a reconnect, so clients re-send on
 `connect`. Without that a tab goes quiet after its first dropped connection and
 the symptom is indistinguishable from a quiet hour.
 
+Every event carries `tournamentId`, `tournamentDate`, `dailySlot`, `slotNumber`,
+`name` and the tournament's `status` — see `tournamentRef` in `notify.ts`. A
+client showing three cards needs to know which one changed, and an event that
+omitted it would update the wrong card.
+
 | Event | Sent to | Carries |
 |---|---|---|
-| `tournament:created` | lobby | slot, number, name |
-| `tournament:registration_opened` | lobby | deadline, sizes |
+| `tournament:created` | lobby | the identity block, start time, when registration opens |
+| `tournament:registration_opened` | lobby | every window on the row, sizes |
 | `tournament:registration_updated` | lobby | human/bot/total counts |
-| `tournament:checkin_opened` | lobby | deadline, registered humans |
+| `tournament:checkin_opened` | lobby | check-in window, start time, registered humans |
 | `tournament:checkin_closed` | lobby | final counts |
 | `tournament:started` | lobby | rounds, players |
 | `tournament:bracket_updated` | lobby | match/round |
@@ -241,11 +297,12 @@ the symptom is indistinguishable from a quiet hour.
 | `tournament:match_started` | lobby | round, match |
 | `tournament:match_completed` | lobby | winner, outcome, scores |
 | `tournament:round_completed` | lobby | round number |
-| `tournament:completed` | lobby | winner |
+| `tournament:completed` | lobby | **that tournament's** winner and `completedAtMs` |
 | `tournament:cancelled` | lobby | reason |
-| `tournament:next_scheduled` | lobby | the replacement in a released slot |
-| `tournament:bot_added` | lobby | bot id, difficulty |
-| `tournament:bot_status_updated` | lobby | bot state |
+| `tournament:next_scheduled` | lobby | a future day has been published |
+| `tournament:countdown_started` | lobby | fast-start only |
+| `tournament:bot_added` / `bot_status_updated` | lobby | bot id, difficulty, state |
+| `tournament:player_replaced_by_bot` | **the opponent only** | who dropped, which bot took over |
 
 Bot gameplay reuses the existing events verbatim — `s:draw:begin`,
 `s:draw:append`, `s:draw:end`, `s:chat:message`, `s:game:roundStart`,
@@ -254,34 +311,59 @@ person's, which is the point: it goes through the same relay.
 
 ---
 
-## 7. Environment
+## 8. Environment
 
 ```bash
-TOURNAMENT_SLOT_COUNT=3              # the product rule
+TOURNAMENT_TIMEZONE=Asia/Kolkata       # the day, and what "20:00" means
+TOURNAMENT_MORNING_AT=10:00
+TOURNAMENT_AFTERNOON_AT=15:00
+TOURNAMENT_EVENING_AT=20:00
+TOURNAMENT_PREPARE_DAYS_AHEAD=1        # today and tomorrow
+
+TOURNAMENT_REGISTRATION_LEAD_MINUTES=90   # before the start, registration opens
+TOURNAMENT_CHECKIN_LEAD_MINUTES=10        # before the start, it closes
+TOURNAMENT_CHECKIN_ENABLED=true           # the daily model needs this on
+
 TOURNAMENT_MIN_PLAYERS=4
-TOURNAMENT_MAX_PLAYERS=16            # a ceiling, not a quota
-TOURNAMENT_MIN_HUMAN_PLAYERS=1       # makes a bot-only tournament impossible
+TOURNAMENT_MAX_PLAYERS=16              # a ceiling, not a quota
+TOURNAMENT_MIN_HUMAN_PLAYERS=1         # makes a bot-only tournament impossible
 TOURNAMENT_MAX_BOTS=3
 TOURNAMENT_ALLOW_BOTS=true
-TOURNAMENT_BOT_DIFFICULTY=NORMAL     # EASY | NORMAL | HARD
-TOURNAMENT_REGISTRATION_MINUTES=10
-TOURNAMENT_CHECKIN_MINUTES=2
-TOURNAMENT_SCHEDULER_ENABLED=true    # false when an external cron drives it
-TOURNAMENT_SCHEDULER_SECRET=         # required in production
+TOURNAMENT_BOT_DIFFICULTY=NORMAL       # EASY | NORMAL | HARD
+
+TOURNAMENT_BOT_FILL_DELAY_SECONDS=45   # fast-start path only
+TOURNAMENT_START_COUNTDOWN_SECONDS=15  # fast-start path only
+
+TOURNAMENT_SCHEDULER_ENABLED=true      # false when an external cron drives it
+TOURNAMENT_SCHEDULER_SECRET=           # required in production
 ```
 
-Values are **copied onto each tournament at creation**, so a tournament already
-taking registrations keeps the rules it advertised even if the deployment is
-reconfigured mid-window.
+There is **no** `TOURNAMENT_SLOT_COUNT`. Three is not a quantity here, it is
+three named times of day; a deployment wanting a fourth is asking for a
+different product rather than a bigger number.
+
+Sizes and bot policy are **copied onto each tournament at creation**, and so is
+the whole schedule — so a tournament already taking registrations keeps the
+rules *and the start time* it advertised even if the deployment is reconfigured
+mid-window. `openRegistration` writes one field, the status, for exactly this
+reason.
+
+### Turning check-in off
+
+`TOURNAMENT_CHECKIN_ENABLED=false` restores the back-to-back behaviour:
+registration seals on the bot-fill timer or on reaching `minPlayers`, a
+fifteen-second countdown runs (`STARTING`), and joining is the confirmation. The
+daily schedule still publishes three a day; they simply seal earlier. It also
+turns off the check-in push notification, which has nothing to fire on.
 
 ---
 
-## 8. Deployment
+## 9. Deployment
 
 **Option 1 — in-process loop** (`TOURNAMENT_SCHEDULER_ENABLED=true`). The
-realtime process ticks every 15 s. Started from `attachSocketServer`, so it runs
-wherever the rooms are — a scheduler in a process with no socket server would
-open match rooms nobody could join.
+realtime process ticks every five seconds. Started from `attachSocketServer`, so
+it runs wherever the rooms are — a scheduler in a process with no socket server
+would open match rooms nobody could join.
 
 **Option 2 — external cron.** Set `TOURNAMENT_SCHEDULER_ENABLED=false` and:
 
@@ -294,12 +376,18 @@ Both at once is safe. Every tick takes the same distributed lock, so a migration
 from one to the other needs no coordination.
 
 **After deploying, sync the indexes.** They are not an optimisation — they are
-what enforces the slot rule, the duplicate-registration rule and the
+what enforces the daily rule, the duplicate-registration rule and the
 one-match-per-bracket-position rule:
 
 ```bash
 npm run sync-indexes
 ```
+
+This is required when upgrading from the rolling version: it drops
+`one_live_tournament_per_slot` and builds `one_tournament_per_slot_per_day`.
+Rows written by the rolling version have no `tournamentDate` or `dailySlot` and
+will not appear in any day listing; they are inert, and the simplest thing to do
+with them is delete them.
 
 ### The lock
 
@@ -312,95 +400,104 @@ anyway.
 
 ---
 
-## 9. Security
+## 10. What a tick does
+
+1. **Publish** any of today's or tomorrow's three that do not exist yet.
+2. **Open registration** on anything `UPCOMING` whose window has arrived — and
+   only those. Tomorrow evening's tournament exists tonight and must stay dark.
+3. **Advance** every unfinished tournament past whichever deadline has passed;
+   write off one whose start came and went without it ever opening.
+4. **Decide** the matches whose entry deadline lapsed.
+5. **Progress** every running tournament past a finished round.
+
+Step 3 catches per tournament, which is the isolation the product asks for: the
+morning tournament failing to seed must not stop the afternoon one opening.
+
+---
+
+## 11. Security
 
 | Rule | How it is enforced |
 |---|---|
 | Only the backend creates tournaments | No route exists. `createdByType` has one legal value. |
+| Never more than three a day | A unique index on `{tournamentDate, dailySlot, isAutomatic}`. |
+| Users cannot create tournaments | `auto.service` has no `create`; the planner is imported by no handler. |
 | Only the backend creates bot registrations | `botProfileService` is imported by no handler. |
 | Clients cannot impersonate a bot | `seatBot` is unreachable from any handler; bots hold no socket. |
 | Clients cannot set `playerType` / `isBot` | Never read from a payload; set by `seatBot` alone. |
 | Clients cannot set scores or winners | The engine computes both; the bracket copies the engine's standings. |
+| A winner cannot be recorded twice | The close is conditional on the status it expects to replace. |
 | Guessers cannot reach the answer | `serializeGameState` nulls `word` for non-drawers; the bot guesser's only input type has no field for it. |
 | Outsiders cannot enter a match | `room.allowedUserIds`, checked before anything else in `joinRoom`. Refused as 404, so a guessed code confirms nothing. |
 | Match codes are not broadcast | Blanked in `toMatchDto` for non-participants. |
 | No duplicate registrations | Two partial unique indexes. |
-| One tournament per player | Indexed query on `{userId, status}` at registration. |
+| No two matches at once | Checked at `match.service.enter`. |
 | Bots are off every human leaderboard | `endGame` filters `humanStandings` before every durable write. |
-| Bots have no voice | Tournament match rooms set `voiceEnabled: false`; a 1v1 drawer may never use voice anyway. |
+| Bots have no voice | Tournament match rooms set `voiceEnabled: false`. |
 
 ---
 
-## 10. Testing
+## 12. Testing
 
 ```bash
-npm run test           # 519 tests, 24 files
+npm run test           # 631 tests, 27 files
 ```
 
 | File | Covers |
 |---|---|
+| `tests/dailyTournament.test.ts` | The daily rules, against a real mongod: three a day and never four, concurrent schedulers, restarts, cancellation, name rotation and its consecutive-day guarantee, the schedule arithmetic, timezone day boundaries and DST, the winner belonging to one tournament, and a hundred players across a day. |
+| `tests/autoTournament.test.ts` | Registration, check-in, brackets, byes, advancement idempotency, the winner snapshot surviving a rename, joining more than one of a day's tournaments, and the fast-start path under its own configuration. |
 | `tests/botFill.test.ts` | Every fill case, including the cancel paths and the ceilings. |
 | `tests/botPlayer.test.ts` | Guesser inputs, mask filtering, difficulty, drawing plans, template coverage. |
-| `tests/botMatch.test.ts` | The driver: word selection, strokes reaching the board, guesses reaching the engine, and timer cleanup. |
-| `tests/autoTournament.test.ts` | Against a real mongod: slots, concurrency, the lock, registration rules, check-in, bot fill, bracket shape, byes, advancement idempotency, completion, and what a client is shown. |
+| `tests/botMatch.test.ts` | The driver: word selection, strokes reaching the board, guesses reaching the engine, timer cleanup. |
 
-The database-backed file is the one that matters most: "never a fourth
-tournament" is a partial unique index, "a winner is never advanced twice" is a
-filter on a slot still being null. Neither can be demonstrated against a mock.
+On the app side, `test/widget/tournaments_screen_test.dart` pins the screen's
+*absences* — no create button, no second play button, no join on a finished
+card, no "enter match" without an assigned match — because an absence is
+exactly what a refactor puts back and nothing in the type system notices.
 
-### Two bugs the tests found
+### Two bugs the tests found (still worth knowing)
 
 1. **Compound `sparse` indexes do not skip null components.** The registration
    uniqueness indexes were sparse; because every row has a `tournamentId`, every
    row was indexed — so the second human in a tournament collided with the first
-   on `{tournamentId, botId: null}`. The symptom was a tournament that silently
-   admitted exactly one player and one bot. Fixed with
-   `partialFilterExpression`.
+   on `{tournamentId, botId: null}`. Fixed with `partialFilterExpression`.
 
-2. **A bot picked a word and then never drew.** Word selection and drawing are
-   both work for the same seat in the same round, and the "already running?"
-   check matched on seat and round alone — so the finished selection task made
-   the drawing look like work already under way. Only an end-to-end run found
-   it, because every unit test set the phase to `drawing` directly. Fixed by
-   giving each task a kind.
-
-A third was found the same way: `wordService.pool` returns empty on an unseeded
-word bank while the *drawer's* word comes from a built-in fallback, so a bot
-would silently say nothing all turn. `guessablePool` now applies the same
-fallback, in one place.
+2. **A bot picked a word and then never drew.** The "already running?" check
+   matched on seat and round alone, so a finished selection task made the
+   drawing look like work already under way. Fixed by giving each task a kind.
 
 ---
 
-## 11. Known limitations
+## 13. Known limitations
 
+- **Capacity is a count, not a claim.** `register` counts the roster and
+  compares it to `maxPlayers`; under enough *simultaneous* joins more than
+  `maxPlayers` could slip in, and the seeder would then truncate the bracket at
+  `maxBracketSize` and leave somebody registered but unseeded. An atomic
+  claim on a counter would close it.
 - **The bot does not see the drawing.** It compares coarse statistics of the
-  board against its own template library. On a large seeded word bank that is a
-  weak signal and most correct guesses come from mask filtering late in a turn.
-  On a small bank (or the unseeded fallback) bots guess well — as the end-to-end
-  run showed, where a bot won turns off a blank canvas because ten candidates
-  filtered to one.
-- **Bot drawings are a fixed library of twenty words.** Anything else draws a
-  neutral fallback, which is unguessable by design. Worth extending from the
-  `bot drawing fell back to a generic template` log line.
+  board against its own template library.
+- **Bot drawings are a fixed library.** Anything outside it draws a neutral
+  fallback, unguessable by design.
 - **Brackets do not survive a process restart mid-match.** The room's board and
-  countdown only ever existed in memory. The match's entry deadline then decides
-  it as a walkover or cancels it; the bracket itself is durable throughout.
+  countdown only ever existed in memory; the match's entry deadline then decides
+  it. The bracket itself is durable throughout.
 - **Presence is process-local.** The walkover check reads `socketIds` from the
   in-memory registry, so under a multi-instance deployment a player connected to
-  another instance could read as absent. A Redis adapter fixes this; the socket
-  layer is already structured for one.
-- **One lock for all tournaments.** Fine at three; a deployment running many
-  slots would want per-tournament locks.
-- **The three-slot listing is read on every tick by every viewer.** Backed by
-  indexes and denormalised counts, but not cached — worth a short TTL cache if
-  the tournament screen becomes the busiest in the app.
+  another instance could read as absent. A Redis adapter fixes this.
+- **One lock for all tournaments.** Fine at three a day.
+- **The day listing is read on every tick by every viewer.** Backed by indexes
+  and denormalised counts, but not cached — worth a short TTL cache if the
+  tournament screen becomes the busiest in the app.
 
-## 12. Possible next steps
+## 14. Possible next steps
 
+- Claim capacity atomically, closing the overshoot above.
 - Seed drawing templates from the actual word bank rather than a fixed twenty.
-- Per-tournament bot difficulty, so slot 3 can be the hard one.
-- Spectating a tournament final — the room already supports spectators, it is
-  only switched off for match rooms.
-- A `tournament:standings` push so the bracket updates without a re-read.
-- Redis adapter, which turns the presence limitation above into a non-issue and
-  lets several instances share the socket fan-out.
+- Per-slot bot difficulty, so the evening tournament can be the hard one.
+- Spectating a final — the room already supports spectators, it is only switched
+  off for match rooms.
+- A results screen for a past day (`/api/tournaments/today?date=` already serves
+  it).
+- Redis adapter, which turns the presence limitation above into a non-issue.

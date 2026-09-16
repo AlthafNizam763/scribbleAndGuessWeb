@@ -8,6 +8,7 @@ import { Achievement } from '@/models/Achievement';
 import { AutoTournament, TournamentRegistration } from '@/models/AutoTournament';
 import { Game } from '@/models/Game';
 import { Notification } from '@/models/Notification';
+import { NotificationLog } from '@/models/NotificationLog';
 import { Report } from '@/models/Report';
 import { Room } from '@/models/Room';
 import { TournamentBotProfile, TournamentSchedulerLock } from '@/models/TournamentBotProfile';
@@ -15,6 +16,7 @@ import { TournamentMatch, TournamentRound } from '@/models/TournamentMatch';
 import { RoomInvitation } from '@/models/RoomInvitation';
 import { Round } from '@/models/Round';
 import { User } from '@/models/User';
+import { UserDeviceToken } from '@/models/UserDeviceToken';
 import { Word } from '@/models/Word';
 import { XpEvent } from '@/models/XpEvent';
 import { logger } from '@/utils/logger';
@@ -72,6 +74,12 @@ const MODELS: SyncableModel[] = [
   Round,
   Word,
   Notification,
+  // Push. Both of these carry unique indexes that are load-bearing rather than
+  // decorative: one token belongs to one device, and one person is told about
+  // one tournament's check-in exactly once. A deployment that skipped them
+  // would deliver duplicate notifications on every repeated scheduler tick.
+  UserDeviceToken,
+  NotificationLog,
   Achievement,
   XpEvent,
   ChatMessage,
@@ -97,6 +105,10 @@ const PLAY_DATA: SyncableModel[] = [
   Round,
   ChatMessage,
   Notification,
+  // Purged with the rest of play data. The device tokens are deliberately
+  // *not*: wiping a test database should not unsubscribe the handset the
+  // tester is holding.
+  NotificationLog,
   Achievement,
   XpEvent,
   Report,

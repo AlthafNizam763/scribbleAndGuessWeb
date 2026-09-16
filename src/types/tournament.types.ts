@@ -1,6 +1,7 @@
 import type {
   AutoTournamentStatusWire,
   BotDifficultyWire,
+  DailySlotWire,
   MatchOutcomeWire,
   MatchStatusWire,
   PlayerTypeWire,
@@ -27,8 +28,23 @@ import type {
  */
 export interface AutoTournamentDto {
   id: string;
+
+  /**
+   * The calendar day this tournament belongs to, `YYYY-MM-DD`, in the
+   * deployment's timezone rather than the reader's.
+   *
+   * Sent so a client can say "today" without doing its own midnight
+   * arithmetic against a clock that might be in another zone — the day the
+   * schedule belongs to is a server fact.
+   */
+  tournamentDate: string;
+
+  /** Which of the day's three this is. */
+  dailySlot: DailySlotWire;
+
+  /** The same thing as a number, 1 to 3, for ordering. */
   slotNumber: number;
-  tournamentNumber: number;
+
   name: string;
   description: string;
   status: AutoTournamentStatusWire;
@@ -50,6 +66,28 @@ export interface AutoTournamentDto {
 
   registrationOpenAtMs: number;
   registrationCloseAtMs: number;
+  /** When bots begin taking the empty seats. Null once they have. */
+  botFillAtMs: number | null;
+  /** When the start countdown ends, or null when none is running. */
+  countdownEndsAtMs: number | null;
+  /**
+   * Whichever deadline this tournament is actually counting down to.
+   *
+   * ## Why the server picks it rather than the client
+   *
+   * Because "which clock do I show" is a question about the lifecycle, and the
+   * lifecycle is server state. A client deriving it would need to know that
+   * `STARTING` means the countdown, that `REGISTRATION` means the bot fill
+   * unless it has passed, and that a missing bot-fill time means the
+   * registration close — three rules that would have to be reimplemented in
+   * Flutter and in the web client and kept in step with this file.
+   *
+   * One number, always the next thing that will happen, always absolute so a
+   * client that was backgrounded renders the right remaining time.
+   */
+  phaseEndsAtMs: number | null;
+  /** Whether the caller must confirm before the bracket is drawn. */
+  checkInRequired: boolean;
   checkInOpenAtMs: number;
   checkInCloseAtMs: number;
   startAtMs: number;
@@ -63,9 +101,20 @@ export interface AutoTournamentDto {
   /** Why a cancelled tournament was cancelled. Null otherwise. */
   cancelReason: string | null;
 
+  /** When it finished, or null while it has not. */
+  completedAtMs: number | null;
+
   /** The caller's own state in this tournament. */
   viewer: ViewerTournamentStateDto;
 
+  /**
+   * Who won this tournament, or null until one has.
+   *
+   * A snapshot taken when the final was decided, so the name and avatar are
+   * the ones they won under even if the person has since renamed themselves.
+   * Scoped to this tournament and no other: a client drawing three cards gets
+   * three independent answers, and two of them are usually null.
+   */
   winner: TournamentParticipantDto | null;
 }
 
@@ -90,8 +139,11 @@ export interface ViewerTournamentStateDto {
   /**
    * Why the caller cannot join, in a sentence they can act on.
    *
-   * Null when they can. The common case is "you are already in Daily Scribble
-   * Cup #4", which is the one refusal a player would otherwise find baffling.
+   * Almost always null now. It carried "you are already in another tournament"
+   * under the old one-at-a-time rule, which no longer exists — a player may be
+   * in all three of a day's tournaments. What is left is the tournament's own
+   * state, which the status and the clock on the card already say, so there is
+   * usually nothing here worth a sentence.
    */
   blockedReason: string | null;
   /** The match this caller should be entering, if any. */

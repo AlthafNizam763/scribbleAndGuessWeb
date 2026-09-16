@@ -72,6 +72,25 @@ export const TIMING = {
    */
   reconnectGraceMs: 45_000,
   /**
+   * The same grace, inside a tournament bracket match.
+   *
+   * ## Why a bracket match is less patient than an ordinary room
+   *
+   * Because of who is waiting. In a casual room a disconnected player costs
+   * nobody anything — the round carries on with whoever is left, and a long
+   * grace is a kindness to somebody on a train. In a bracket match there are
+   * two players, so one of them dropping means the *other* is sitting in a
+   * frozen duel; and behind that match is a bracket, and behind the bracket a
+   * tournament, all of which stop until this resolves.
+   *
+   * Fifteen seconds covers the thing that actually happens — an app
+   * backgrounded at a traffic light, a wifi-to-cellular handover — and
+   * anything longer is not a blip. Past it the seat is taken over by a bot so
+   * the opponent gets a real game rather than a staring contest; see
+   * `tournamentStandInService`.
+   */
+  tournamentReconnectGraceMs: 15_000,
+  /**
    * Extra grace given specifically to a disconnected *drawer* before the turn
    * is handed to somebody else (brief section 39).
    */

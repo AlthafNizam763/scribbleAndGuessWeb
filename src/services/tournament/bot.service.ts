@@ -3,7 +3,7 @@ import {
   tournamentScheduler,
   type SchedulerTickResult,
 } from '@/services/tournament/scheduler.service';
-import { tournamentSlotManager } from '@/services/tournament/slotManager.service';
+import { tournamentDailyPlanner } from '@/services/tournament/dailyPlanner.service';
 import { logger } from '@/utils/logger';
 
 /**
@@ -57,7 +57,7 @@ export class TournamentBot {
     tournamentScheduler.start();
 
     logger.info('tournament organiser running', {
-      slots: tournamentSlotManager.slotCount,
+      perDay: tournamentDailyPlanner.perDay,
     });
   }
 

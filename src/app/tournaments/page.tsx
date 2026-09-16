@@ -23,18 +23,18 @@ import {
   enterTournamentMatch,
   fetchTournamentBracket,
   fetchTournamentParticipants,
-  fetchTournamentSlots,
+  fetchTournamentDay,
   registerForTournament,
   withdrawFromTournament,
-  type TournamentSlotDto,
+  type TournamentDayDto,
 } from '@/web/tournaments';
 
 /**
- * The tournament slots, in the browser.
+ * The day's tournaments, in the browser.
  *
  * ## The same feature, not a second one
  *
- * Every rule on this page is the server's: whether a slot can be joined,
+ * Every rule on this page is the server's: whether a tournament can be joined,
  * whether check-in is open, why a player is blocked, and which matches show
  * a room code. The page reads `viewer` and draws it. There is no local idea of
  * the tournament lifecycle here — that is exactly what the Flutter client
@@ -57,7 +57,11 @@ export default function TournamentsPage() {
   const router = useRouter();
   const { session } = useGame();
 
-  const [slots, setSlots] = useState<TournamentSlotDto[]>([]);
+  const [day, setDay] = useState<TournamentDayDto>({
+    tournamentDate: '',
+    timeZone: 'UTC',
+    tournaments: [],
+  });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -67,7 +71,7 @@ export default function TournamentsPage() {
   const load = useCallback(async () => {
     setError(null);
     try {
-      setSlots(await fetchTournamentSlots(session?.token ?? null));
+      setDay(await fetchTournamentDay(session?.token ?? null));
     } catch (cause) {
       setError(
         cause instanceof ApiError
@@ -91,9 +95,9 @@ export default function TournamentsPage() {
    * subscribed once would go quiet after its first dropped connection and
    * never notice, because the symptom is identical to a quiet hour.
    *
-   * Every event is treated the same way: re-read the three slots. The payloads
-   * carry enough to patch in place, and patching would mean a second model of
-   * the lifecycle living in this file.
+   * Every event is treated the same way: re-read the day. The payloads carry
+   * enough to patch in place, and patching would mean a second model of the
+   * lifecycle living in this file.
    */
   useEffect(() => {
     const socket = getSocket();
@@ -114,7 +118,7 @@ export default function TournamentsPage() {
     };
   }, [load]);
 
-  /** Runs one write, then re-reads: joining one slot changes all three. */
+  /** Runs one write, then re-reads the day. */
   const act = useCallback(
     async (
       tournamentId: string,
@@ -132,8 +136,10 @@ export default function TournamentsPage() {
         setNotice(success);
         await load();
       } catch (cause) {
-        // The server's own sentence. "You are already in Daily Scribble Cup
-        // #4" is the refusal a player would otherwise find baffling.
+        // The server's own sentence. "Registration has closed for this
+        // tournament" is the refusal a player would otherwise find baffling,
+        // and it is a different sentence from the four other ways a join can
+        // be refused.
         setError(
           cause instanceof ApiError ? cause.friendlyMessage : 'That did not work.',
         );
@@ -164,86 +170,81 @@ export default function TournamentsPage() {
     [session, router],
   );
 
-  const allEmpty = useMemo(
-    () => slots.length === 0 || slots.every((slot) => slot.tournament === null),
-    [slots],
-  );
+  const empty = useMemo(() => day.tournaments.length === 0, [day]);
 
   return (
     <PageShell title="Tournaments">
       <p className="muted" style={{ marginTop: 0 }}>
-        Tournaments run themselves. Join one and play — the server creates them,
-        fills short rosters with clearly-labelled AI players, draws the bracket
-        and replaces each one when it finishes.
+        Three tournaments every day — morning, afternoon and evening. The server
+        runs them: it publishes the schedule, fills short rosters with
+        clearly-labelled AI players, draws the bracket and decides the matches.
+        Join as many of the day&apos;s three as you like.
       </p>
 
       {notice ? <div className="banner banner--ok">{notice}</div> : null}
 
       <ListState
-        loading={loading && slots.length === 0}
-        error={error && slots.length === 0 ? error : null}
+        loading={loading && empty}
+        error={error && empty ? error : null}
         empty={false}
         emptyText=""
         onRetry={() => void load()}
       />
 
-      {error && slots.length > 0 ? (
+      {error && !empty ? (
         <div className="banner banner--error">{error}</div>
       ) : null}
 
-      {!loading && allEmpty ? (
+      {!loading && empty ? (
         <div className="empty">
           <p style={{ marginTop: 0 }}>
-            <strong>No tournaments running right now</strong>
+            <strong>Nothing scheduled for today</strong>
           </p>
-          <p className="muted">New tournaments are created automatically.</p>
+          <p className="muted">
+            Tomorrow&apos;s three are published automatically.
+          </p>
         </div>
       ) : null}
 
-      {slots.map((slot) => (
-        <SlotCard
-          key={slot.slotNumber}
-          slot={slot}
-          busy={busyId === slot.tournament?.id}
-          expanded={openId === slot.tournament?.id}
+      {day.tournaments.map((tournament) => (
+        <TournamentCard
+          key={tournament.id}
+          tournament={tournament}
+          timeZone={day.timeZone}
+          busy={busyId === tournament.id}
+          expanded={openId === tournament.id}
           token={session?.token ?? null}
           onToggle={() =>
-            setOpenId((current) =>
-              current === slot.tournament?.id ? null : (slot.tournament?.id ?? null),
-            )
+            setOpenId((current) => (current === tournament.id ? null : tournament.id))
           }
           onJoin={() =>
-            slot.tournament &&
-            void act(slot.tournament.id, registerForTournament, 'You are in. Good luck!')
+            void act(tournament.id, registerForTournament, 'You are in. Good luck!')
           }
           onWithdraw={() =>
-            slot.tournament &&
             void act(
-              slot.tournament.id,
+              tournament.id,
               withdrawFromTournament,
               'You have left the tournament.',
             )
           }
           onCheckIn={() =>
-            slot.tournament &&
             void act(
-              slot.tournament.id,
+              tournament.id,
               checkInToTournament,
               'Checked in. Your match is coming up.',
             )
           }
-          onEnter={(matchId) =>
-            slot.tournament && void enter(slot.tournament.id, matchId)
-          }
+          onEnter={(matchId) => void enter(tournament.id, matchId)}
         />
       ))}
     </PageShell>
   );
 }
 
-/** One slot: the tournament in it, or the fact that there is not one. */
-function SlotCard({
-  slot,
+/** One of the day's tournaments. */
+function TournamentCard({
+  tournament,
+  timeZone,
   busy,
   expanded,
   token,
@@ -253,7 +254,8 @@ function SlotCard({
   onCheckIn,
   onEnter,
 }: {
-  slot: TournamentSlotDto;
+  tournament: AutoTournamentDto;
+  timeZone: string;
   busy: boolean;
   expanded: boolean;
   token: string | null;
@@ -263,21 +265,6 @@ function SlotCard({
   onCheckIn: () => void;
   onEnter: (matchId: string) => void;
 }) {
-  const tournament = slot.tournament;
-
-  if (!tournament) {
-    return (
-      <section className="card">
-        <p style={{ margin: 0 }}>
-          <strong>Slot {slot.slotNumber}</strong> — no tournament in this slot
-        </p>
-        <p className="muted" style={{ marginBottom: 0 }}>
-          A new one will be created automatically soon.
-        </p>
-      </section>
-    );
-  }
-
   const viewer = tournament.viewer;
 
   return (
@@ -286,7 +273,8 @@ function SlotCard({
         <div style={{ flex: 1 }}>
           <h2 style={{ margin: 0 }}>{tournament.name}</h2>
           <p className="muted" style={{ margin: '0.15rem 0 0' }}>
-            Slot {tournament.slotNumber} · Knockout · Free entry
+            {slotLabel(tournament.dailySlot)} ·{' '}
+            {startClock(tournament.startAtMs, timeZone)} · Knockout · Free entry
           </p>
         </div>
         <StatusPill status={tournament.status} />
@@ -602,4 +590,41 @@ function MatchSeat({
       {won ? <span aria-hidden>✓</span> : null}
     </div>
   );
+}
+
+/** "Morning", "Afternoon", "Evening". */
+function slotLabel(slot: AutoTournamentDto['dailySlot']): string {
+  switch (slot) {
+    case 'MORNING':
+      return 'Morning';
+    case 'AFTERNOON':
+      return 'Afternoon';
+    case 'EVENING':
+      return 'Evening';
+    default:
+      return 'Daily';
+  }
+}
+
+/**
+ * The start time, in the schedule's own zone rather than the browser's.
+ *
+ * A player in another timezone reading "20:00" off their own clock would turn
+ * up four hours late. The zone comes down with the listing for exactly this,
+ * and is shown alongside so the number is unambiguous.
+ */
+function startClock(startAtMs: number, timeZone: string): string {
+  if (!startAtMs) return '';
+
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZoneName: 'short',
+    }).format(new Date(startAtMs));
+  } catch {
+    // An unknown zone name should cost a label, not the page.
+    return new Date(startAtMs).toLocaleTimeString();
+  }
 }

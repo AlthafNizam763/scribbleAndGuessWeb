@@ -4,15 +4,15 @@ import { connectToDatabase } from '@/config/database';
 import { env } from '@/config/env';
 import {
   AUTO_TOURNAMENT_STATUS,
+  LIVE_STATUSES,
   SCHEDULER_TIMING,
-  SLOT_HOLDING_STATUSES,
 } from '@/constants/autoTournament.constants';
 import { AutoTournament, type AutoTournamentDocument } from '@/models/AutoTournament';
 import { TournamentSchedulerLock } from '@/models/TournamentBotProfile';
 import { botProfileService } from '@/services/bot/botProfile.service';
+import { tournamentDailyPlanner } from '@/services/tournament/dailyPlanner.service';
 import { tournamentLifecycleService } from '@/services/tournament/lifecycle.service';
 import { tournamentMatchService } from '@/services/tournament/match.service';
-import { tournamentSlotManager } from '@/services/tournament/slotManager.service';
 import { logger } from '@/utils/logger';
 
 /**
@@ -23,15 +23,23 @@ import { logger } from '@/utils/logger';
  * Exactly one pass over the world, in an order chosen so that work created by
  * one step is picked up by a later one in the same tick where that is safe:
  *
- * 1. Refill any vacant slot, so a tournament that finished last tick has a
- *    replacement now.
- * 2. Open registration on anything still `UPCOMING` — including what step 1
- *    just created, so a new tournament is joinable within one tick of
- *    existing rather than two.
- * 3. Advance every slot-holding tournament past whichever of its deadlines has
- *    passed.
+ * 1. Publish any of today's or tomorrow's three tournaments that do not exist
+ *    yet, so the day rolls over into a schedule rather than an empty screen.
+ * 2. Open registration on anything `UPCOMING` whose window has arrived —
+ *    including what step 1 just created, which matters on the first boot of a
+ *    deployment where a slot's window is already open.
+ * 3. Advance every unfinished tournament past whichever of its deadlines has
+ *    passed — the registration window, the check-in window, or, on a
+ *    deployment running without check-in, the bot fill and the countdown.
  * 4. Decide the matches whose entry deadline lapsed.
  * 5. Move every running tournament past a finished round.
+ *
+ * ## What it does not do
+ *
+ * Create a replacement for anything. A tournament that completes or is
+ * cancelled leaves nothing to fill: its slot is a date and a time of day, both
+ * of which are now in the past. The next tournament is the next one on the
+ * schedule, which step 1 published hours ago.
  *
  * ## Why one lock and not one per tournament
  *
@@ -103,7 +111,8 @@ export class TournamentScheduler {
 
     logger.info('tournament scheduler started', {
       tickMs: SCHEDULER_TIMING.tickMs,
-      slots: tournamentSlotManager.slotCount,
+      perDay: tournamentDailyPlanner.perDay,
+      timeZone: env.tournament.timeZone,
       owner: OWNER,
     });
   }
@@ -155,7 +164,7 @@ export class TournamentScheduler {
       // Cached after the first call, so this is free on every later tick.
       await botProfileService.ensureSeeded();
 
-      result.created = (await tournamentSlotManager.fillVacantSlots()).length;
+      result.created = (await tournamentDailyPlanner.ensureScheduled()).length;
       result.opened = await this.openNewTournaments(result);
       result.advanced = await this.advanceDeadlines(result);
       result.matchesDecided = await tournamentMatchService.sweepEntryDeadlines();
@@ -176,11 +185,28 @@ export class TournamentScheduler {
 
   // ------------------------------------------------------------------ steps
 
-  /** Opens registration on everything still dark. */
+  /**
+   * Opens registration on every tournament whose window has arrived.
+   *
+   * ## Why the filter is on the clock and not just the status
+   *
+   * Because most `UPCOMING` tournaments are not due. Tomorrow evening's exists
+   * from today and must sit dark until ninety minutes before it starts — the
+   * rolling system opened everything it found, because everything it found had
+   * been created a moment earlier for that purpose. Opening on sight here
+   * would put all of tomorrow's tournaments into registration tonight.
+   */
   private async openNewTournaments(result: SchedulerTickResult): Promise<number> {
+    const now = new Date();
+
     const upcoming = await AutoTournament.find({
       isAutomatic: true,
       status: AUTO_TOURNAMENT_STATUS.upcoming,
+      registrationOpenAt: { $lte: now },
+      // And not already over. A scheduler that was down all morning should
+      // not announce "registration is open" for a tournament whose window
+      // closed two hours ago; the sweep below writes that one off instead.
+      registrationCloseAt: { $gt: now },
     })
       .lean()
       .exec();
@@ -206,20 +232,20 @@ export class TournamentScheduler {
   /**
    * Advances every tournament whose deadline has passed.
    *
-   * ## Why the whole set is loaded rather than two targeted queries
+   * ## Why the whole set is loaded rather than several targeted queries
    *
-   * There are three of them. Loading all the slot-holders and branching in
-   * memory is one indexed query instead of two, and it is what lets the catch
-   * sit around each tournament rather than around each query — which is the
-   * isolation the product asked for: slot 1 failing must not stop slots 2
-   * and 3.
+   * There are at most six — today's three and tomorrow's. Loading the
+   * unfinished ones and branching in memory is one indexed query instead of
+   * four, and it is what lets the catch sit around each tournament rather than
+   * around each query, which is the isolation the product asked for: the
+   * morning tournament failing must not stop the afternoon one opening.
    */
   private async advanceDeadlines(result: SchedulerTickResult): Promise<number> {
     const now = new Date();
 
     const live = await AutoTournament.find({
       isAutomatic: true,
-      status: { $in: [...SLOT_HOLDING_STATUSES] },
+      status: { $in: [...LIVE_STATUSES] },
     })
       .lean()
       .exec();
@@ -230,11 +256,65 @@ export class TournamentScheduler {
       const tournament = row as AutoTournamentDocument;
 
       try {
-        if (
-          tournament.status === AUTO_TOURNAMENT_STATUS.registration &&
-          tournament.registrationCloseAt <= now
-        ) {
-          if (await tournamentLifecycleService.closeRegistration(tournament)) advanced += 1;
+        // A scheduled tournament that was never opened, whose start time has
+        // now passed. Only reachable after an outage that spanned its whole
+        // window — but a row nothing will ever advance is worse than a
+        // cancelled one, because the listing would show it as upcoming for
+        // ever.
+        if (tournament.status === AUTO_TOURNAMENT_STATUS.upcoming) {
+          if (tournament.startAt <= now) {
+            if (
+              await tournamentLifecycleService.cancel(
+                tournament,
+                'This tournament could not be started.',
+              )
+            ) {
+              advanced += 1;
+            }
+          }
+          continue;
+        }
+
+        if (tournament.status === AUTO_TOURNAMENT_STATUS.registration) {
+          // Ordered by how final each door is. The window closing is a hard
+          // deadline and wins over everything; a full roster beats the fill
+          // timer because it means no bot is needed at all.
+          if (tournament.registrationCloseAt <= now) {
+            if (await tournamentLifecycleService.closeRegistration(tournament)) advanced += 1;
+            continue;
+          }
+
+          // Both early doors belong to the fast-start path. With check-in
+          // switched back on, a tournament leaves `REGISTRATION` only at its
+          // deadline and only into `CHECK_IN` — taking either of these would
+          // start the bracket without ever asking the question the flag exists
+          // to ask.
+          if (env.tournament.checkInEnabled) continue;
+
+          if (await tournamentLifecycleService.startEarlyIfFull(tournament)) {
+            advanced += 1;
+            continue;
+          }
+
+          // A row written before `botFillAt` existed has none. Treated as due,
+          // because such a row has by definition been waiting through a
+          // deploy and the fast path is the whole point.
+          const fillDue = !tournament.botFillAt || tournament.botFillAt <= now;
+          if (fillDue && (await tournamentLifecycleService.fillAndStart(tournament))) {
+            advanced += 1;
+          }
+          continue;
+        }
+
+        if (tournament.status === AUTO_TOURNAMENT_STATUS.starting) {
+          // A countdown with no end is a tournament that reached this state
+          // before the field existed, or a write that half-landed. Starting it
+          // is the safe reading: the roster is already sealed, and the failure
+          // to avoid is a tournament that counts down for ever.
+          const due = !tournament.countdownEndsAt || tournament.countdownEndsAt <= now;
+          if (due && (await tournamentLifecycleService.startCountedDownTournament(tournament))) {
+            advanced += 1;
+          }
           continue;
         }
 
@@ -251,7 +331,8 @@ export class TournamentScheduler {
         result.errors += 1;
         logger.exception('advancing a tournament failed', error, {
           tournamentId: String(tournament._id),
-          slotNumber: tournament.slotNumber,
+          tournamentDate: tournament.tournamentDate,
+          dailySlot: tournament.dailySlot,
           status: tournament.status,
         });
       }

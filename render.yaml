@@ -112,6 +112,50 @@ services:
       - key: WEBRTC_TURN_CREDENTIAL
         sync: false
 
+      # Push notifications.
+      #
+      # A Firebase *service account*, which can deliver a notification to any
+      # device in the project — so all three are `sync: false` and live in
+      # Render's dashboard, never in this file. Leave them unset to run without
+      # push: the tournament scheduler is unaffected and every send is a logged
+      # no-op.
+      #
+      # FIREBASE_PRIVATE_KEY is a PEM block pasted as one line with its
+      # newlines written as the two characters \n. See .env.example.
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+
+      # The timezone the tournament day and its three slot times are read in.
+      #
+      # Pinned rather than left to the default because it decides when the
+      # day rolls over and what "evening" means, and neither should depend on
+      # which region Render happens to run this in.
+      - key: TOURNAMENT_TIMEZONE
+        value: Asia/Kolkata
+
+      # The day's three tournaments, in that zone. There is no fourth: the
+      # database keys them on {date, slot} behind a unique index.
+      - key: TOURNAMENT_MORNING_AT
+        value: "10:00"
+      - key: TOURNAMENT_AFTERNOON_AT
+        value: "15:00"
+      - key: TOURNAMENT_EVENING_AT
+        value: "20:00"
+
+      # The check-in phase must be on for a check-in notification to exist at
+      # all — with it off a tournament goes REGISTRATION -> STARTING -> RUNNING
+      # and never enters CHECK_IN, so the push has nothing to fire on. It is
+      # also the right phase for a scheduled tournament: registration opens
+      # ninety minutes before the start, and a bracket drawn from everybody who
+      # tapped join an hour earlier would be half walkovers. Pinned so turning
+      # it off is a deliberate edit.
+      - key: TOURNAMENT_CHECKIN_ENABLED
+        value: "true"
+
     # A drawing game is stateful in memory: the live room registry belongs to
     # this process, and a player's socket must keep reaching the instance that
     # holds their room. Scaling past one instance needs the Redis adapter (see

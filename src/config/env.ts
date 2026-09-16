@@ -1,6 +1,11 @@
 import { config as loadDotenv } from 'dotenv';
 import { z } from 'zod';
 
+import { isKnownTimeZone } from '@/utils/dayKey';
+
+/** A 24-hour wall-clock time. What the tournament slot times are written as. */
+const CLOCK = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
 /**
  * Environment parsing, done once and validated up front.
  *
@@ -101,15 +106,51 @@ const schema = z.object({
   /**
    * The automatic tournament organiser.
    *
-   * ## Why the slot count is configurable but capped
+   * ## Why there is no slot *count*
    *
-   * The product rule is three, and three is the default. It is a variable
-   * rather than a constant so a staging deployment can run one slot and a load
-   * test can run more — but it is bounded, because each slot is a bracket, a
-   * set of rooms and a pool of bot workers, and an operator typing a large
-   * number would quietly commit this process to running all of them.
+   * Because three is not a quantity here, it is three named times of day. The
+   * old rolling system had a configurable number of concurrent slots; this one
+   * has a morning, an afternoon and an evening, and a deployment that wanted a
+   * fourth would be asking for a different product rather than a bigger
+   * number. The times themselves are configurable, which is the part an
+   * operator actually needs.
+   *
+   * ## The timezone
+   *
+   * Everything below is read in this zone: which calendar day it is, and what
+   * "20:00" means. It is configured rather than taken from the host because
+   * the host is in whichever region the platform put it, and the promise is
+   * about the player's day, not the datacentre's. An unknown zone name fails
+   * at boot rather than silently falling back to UTC — a tournament system
+   * quietly running eleven hours out is worse than one that will not start.
    */
-  TOURNAMENT_SLOT_COUNT: z.coerce.number().int().min(1).max(10).default(3),
+  TOURNAMENT_TIMEZONE: z
+    .string()
+    .default('Asia/Kolkata')
+    .refine(isKnownTimeZone, 'not a timezone this runtime knows'),
+
+  /**
+   * When each daily tournament begins, as `HH:MM` in `TOURNAMENT_TIMEZONE`.
+   *
+   * These are the only times in the system an operator sets directly.
+   * Everything else — when registration opens, when it closes, when check-in
+   * ends — is measured backwards from them, because the start is the part that
+   * was published and the windows in front of it are arrangements.
+   */
+  TOURNAMENT_MORNING_AT: z.string().regex(CLOCK, 'expected HH:MM').default('10:00'),
+  TOURNAMENT_AFTERNOON_AT: z.string().regex(CLOCK, 'expected HH:MM').default('15:00'),
+  TOURNAMENT_EVENING_AT: z.string().regex(CLOCK, 'expected HH:MM').default('20:00'),
+
+  /**
+   * How many days ahead the organiser prepares.
+   *
+   * One: today and tomorrow. Enough that the day rolls over with the next
+   * three tournaments already published — so a player opening the app just
+   * after midnight sees a schedule rather than an empty screen — and not so
+   * far that a change to the times takes a week to take effect.
+   */
+  TOURNAMENT_PREPARE_DAYS_AHEAD: z.coerce.number().int().min(0).max(7).default(1),
+
   TOURNAMENT_MIN_PLAYERS: z.coerce.number().int().min(2).max(16).default(4),
   TOURNAMENT_MAX_PLAYERS: z.coerce.number().int().min(2).max(16).default(16),
   TOURNAMENT_MIN_HUMAN_PLAYERS: z.coerce.number().int().min(1).max(16).default(1),
@@ -120,9 +161,45 @@ const schema = z.object({
     .transform((value) => value === 'true'),
   TOURNAMENT_BOT_DIFFICULTY: z.enum(['EASY', 'NORMAL', 'HARD']).default('NORMAL'),
 
-  /** Registration and check-in windows, in minutes. */
-  TOURNAMENT_REGISTRATION_MINUTES: z.coerce.number().min(1).max(240).default(10),
-  TOURNAMENT_CHECKIN_MINUTES: z.coerce.number().min(1).max(60).default(2),
+  /**
+   * How long before a tournament starts its registration opens, in minutes.
+   *
+   * Ninety. The window a player has to notice the thing exists and take a
+   * place in it. Held above the check-in lead below, so there is always a
+   * registration window to open at all.
+   */
+  TOURNAMENT_REGISTRATION_LEAD_MINUTES: z.coerce.number().min(2).max(1_440).default(90),
+
+  /**
+   * How long before the start registration closes and check-in opens.
+   *
+   * Ten minutes: how long a player has to confirm, and how much warning they
+   * get that the thing they signed up for is about to happen.
+   */
+  TOURNAMENT_CHECKIN_LEAD_MINUTES: z.coerce.number().min(1).max(120).default(10),
+
+  /**
+   * The fast-start windows, in seconds.
+   *
+   * Only reached by a deployment running with check-in off, where a tournament
+   * seals its roster on a timer rather than at a published start. Kept because
+   * that deployment is still supported — see `checkInEnabled`.
+   */
+  TOURNAMENT_BOT_FILL_DELAY_SECONDS: z.coerce.number().min(0).max(3_600).default(45),
+  TOURNAMENT_START_COUNTDOWN_SECONDS: z.coerce.number().min(3).max(300).default(15),
+
+  /**
+   * Whether registered players must confirm before the bracket is drawn.
+   *
+   * On by default, because registration for a scheduled tournament opens an
+   * hour and a half before it starts and a bracket drawn from everybody who
+   * tapped join at half past six would be half walkovers. See `checkInEnabled`
+   * in `autoTournament.constants.ts`.
+   */
+  TOURNAMENT_CHECKIN_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
 
   /**
    * Whether this process runs the scheduler loop itself.
@@ -148,6 +225,39 @@ const schema = z.object({
    * by hand without configuration.
    */
   TOURNAMENT_SCHEDULER_SECRET: z.string().default(''),
+
+  /**
+   * Firebase Admin, for push notifications.
+   *
+   * ## Why a service account and not the client SDK's config
+   *
+   * Sending a push is a privileged operation: anybody holding these values can
+   * deliver a notification to any device token in the project. They are a
+   * server credential and are read here only — nothing in `src/web` or in the
+   * Flutter client ever sees them. The client needs `google-services.json`,
+   * which is a different, public-by-design file.
+   *
+   * ## Why all three default to empty
+   *
+   * Because a deployment without push configured has to keep working. Every
+   * other feature in this codebase is unaffected by FCM, and a dev machine
+   * that has never seen a service account should still boot, run the
+   * scheduler, and run the tests. `push.service.ts` reports itself as
+   * unconfigured and every send becomes a logged no-op — see `isConfigured`
+   * there.
+   */
+  FIREBASE_PROJECT_ID: z.string().default(''),
+  FIREBASE_CLIENT_EMAIL: z.string().default(''),
+
+  /**
+   * The service account's private key.
+   *
+   * Almost always supplied with literal `\n` two-character sequences, because
+   * a PEM block cannot survive a single-line `.env` or most secret managers
+   * otherwise. Converted to real newlines below; a key that already has them
+   * passes through unchanged, so both forms work.
+   */
+  FIREBASE_PRIVATE_KEY: z.string().default(''),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -226,19 +336,101 @@ export const env = {
    * a transposed pair of numbers helps nobody.
    */
   tournament: {
-    slotCount: raw.TOURNAMENT_SLOT_COUNT,
+    /** The zone the calendar day and every slot time are read in. */
+    timeZone: raw.TOURNAMENT_TIMEZONE,
+
+    /**
+     * When each slot starts, as minutes after local midnight.
+     *
+     * Parsed here rather than where they are used, so a malformed clock is a
+     * boot failure with the variable's name on it instead of a tournament
+     * scheduled for `NaN`.
+     */
+    slotMinutes: {
+      MORNING: clockMinutes(raw.TOURNAMENT_MORNING_AT),
+      AFTERNOON: clockMinutes(raw.TOURNAMENT_AFTERNOON_AT),
+      EVENING: clockMinutes(raw.TOURNAMENT_EVENING_AT),
+    },
+
+    /** How many days beyond today the organiser publishes. */
+    prepareDaysAhead: raw.TOURNAMENT_PREPARE_DAYS_AHEAD,
+
     minPlayers: raw.TOURNAMENT_MIN_PLAYERS,
     maxPlayers: Math.max(raw.TOURNAMENT_MAX_PLAYERS, raw.TOURNAMENT_MIN_PLAYERS),
     minHumanPlayers: Math.min(raw.TOURNAMENT_MIN_HUMAN_PLAYERS, raw.TOURNAMENT_MIN_PLAYERS),
     maxBots: raw.TOURNAMENT_MAX_BOTS,
     allowBots: raw.TOURNAMENT_ALLOW_BOTS,
     botDifficulty: raw.TOURNAMENT_BOT_DIFFICULTY,
-    registrationMs: Math.round(raw.TOURNAMENT_REGISTRATION_MINUTES * 60_000),
-    checkInMs: Math.round(raw.TOURNAMENT_CHECKIN_MINUTES * 60_000),
+
+    /**
+     * The two leads, with the registration lead held above the check-in lead.
+     *
+     * Clamped rather than validated apart, for the same reason `maxPlayers` is
+     * floored at `minPlayers`: an operator who transposed them would otherwise
+     * get tournaments whose registration closes before it opens, which is a
+     * tournament nobody can ever join. A minute of registration is not much,
+     * but it is a window, and the deployment boots.
+     */
+    registrationLeadMs: Math.max(
+      Math.round(raw.TOURNAMENT_REGISTRATION_LEAD_MINUTES * 60_000),
+      Math.round(raw.TOURNAMENT_CHECKIN_LEAD_MINUTES * 60_000) + 60_000,
+    ),
+    checkInLeadMs: Math.round(raw.TOURNAMENT_CHECKIN_LEAD_MINUTES * 60_000),
+
+    /**
+     * Held inside the registration window, rather than validated against it.
+     *
+     * Only the fast-start path reads this, and there a fill delay longer than
+     * the window it sits inside would mean bots never arrive before
+     * registration closes — the tournament would reach its deadline with an
+     * unfilled roster every time. Clamping leaves a countdown's worth of room.
+     */
+    botFillDelayMs: Math.min(
+      Math.round(raw.TOURNAMENT_BOT_FILL_DELAY_SECONDS * 1_000),
+      Math.max(
+        0,
+        Math.round(raw.TOURNAMENT_REGISTRATION_LEAD_MINUTES * 60_000) -
+          Math.round(raw.TOURNAMENT_CHECKIN_LEAD_MINUTES * 60_000) -
+          Math.round(raw.TOURNAMENT_START_COUNTDOWN_SECONDS * 1_000),
+      ),
+    ),
+    startCountdownMs: Math.round(raw.TOURNAMENT_START_COUNTDOWN_SECONDS * 1_000),
+
+    checkInEnabled: raw.TOURNAMENT_CHECKIN_ENABLED,
     schedulerEnabled: raw.TOURNAMENT_SCHEDULER_ENABLED,
     schedulerSecret: raw.TOURNAMENT_SCHEDULER_SECRET,
   },
+
+  /**
+   * The Firebase service account used to send push notifications.
+   *
+   * `configured` is the single question every caller asks, answered once here
+   * rather than by three separate emptiness checks scattered through the push
+   * service.
+   */
+  firebase: {
+    projectId: raw.FIREBASE_PROJECT_ID.trim(),
+    clientEmail: raw.FIREBASE_CLIENT_EMAIL.trim(),
+    /** Literal `\n` sequences turned back into real newlines. */
+    privateKey: raw.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    configured:
+      raw.FIREBASE_PROJECT_ID.trim().length > 0 &&
+      raw.FIREBASE_CLIENT_EMAIL.trim().length > 0 &&
+      raw.FIREBASE_PRIVATE_KEY.trim().length > 0,
+  },
 } as const;
+
+/**
+ * `HH:MM` as minutes after midnight.
+ *
+ * The schema has already refused anything that is not a clock, so this does no
+ * validation of its own — it would be a second, weaker copy of the check that
+ * already passed.
+ */
+function clockMinutes(value: string): number {
+  const [hours, minutes] = value.split(':');
+  return Number(hours) * 60 + Number(minutes);
+}
 
 /** Splits a comma-separated URL list, dropping blanks. */
 function splitUrls(value: string): string[] {

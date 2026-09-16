@@ -578,13 +578,51 @@ export const TOURNAMENT_EVENTS = {
   completed: { canonical: 's:tournament:completed', alias: 'tournament:completed' },
   /** The tournament was abandoned, with a reason. */
   cancelled: { canonical: 's:tournament:cancelled', alias: 'tournament:cancelled' },
-  /** A slot was released and refilled. Carries the replacement. */
+  /**
+   * A tournament was published for a future slot.
+   *
+   * ## What this used to be
+   *
+   * "A slot was released and refilled, here is the replacement" — the rolling
+   * system's way of telling a client that the cup it was watching had ended
+   * and something had taken its place. Nothing is replaced under the daily
+   * schedule: a completed tournament stays on its day, and the next one has
+   * been published since midnight.
+   *
+   * It survives as the notice that *tomorrow's* schedule now exists, which a
+   * client showing "what's next" can use rather than polling at midnight.
+   * `created` carries the same information for a client that does not care
+   * which day it was for.
+   */
   nextScheduled: {
     canonical: 's:tournament:nextScheduled',
     alias: 'tournament:next_scheduled',
   },
+  /**
+   * The roster is sealed and the start countdown is running.
+   *
+   * Carries `countdownEndsAtMs` and the final human/bot counts, which between
+   * them are everything a lobby needs to render "Starting in 12… — 2 players,
+   * 2 bots" without asking the server again. The clock is sent as an absolute
+   * instant rather than a duration so a client that receives it late, or was
+   * backgrounded, still shows the right number.
+   */
+  countdownStarted: {
+    canonical: 's:tournament:countdownStarted',
+    alias: 'tournament:countdown_started',
+  },
   /** An AI player was added to a roster. */
   botAdded: { canonical: 's:tournament:botAdded', alias: 'tournament:bot_added' },
+  /**
+   * A disconnected player's seat was taken over by a bot mid-match.
+   *
+   * Sent so the opponent's screen can say what happened rather than silently
+   * swapping the name on the other side of the canvas.
+   */
+  playerReplacedByBot: {
+    canonical: 's:tournament:playerReplacedByBot',
+    alias: 'tournament:player_replaced_by_bot',
+  },
   /** An AI player's state changed — seated in a match, eliminated. */
   botStatusUpdated: {
     canonical: 's:tournament:botStatusUpdated',

@@ -7,6 +7,7 @@ import { userRepository } from '@/repositories/user.repository';
 import { chatService } from '@/services/chat.service';
 import { gameService } from '@/services/game.service';
 import { roomService } from '@/services/room.service';
+import { tournamentStandInService } from '@/services/tournament/standIn.service';
 import { timerService } from '@/services/timer.service';
 import type { RuntimeRoom } from '@/types/socket.types';
 import { logger } from '@/utils/logger';
@@ -77,8 +78,15 @@ export class PresenceService {
     // Another device is still connected, so nothing has changed for the room.
     if (player.socketIds.size > 0) return { wentOffline: false };
 
+    // A bracket match is less patient than an ordinary room, because a second
+    // person is sitting in it waiting and a whole tournament is behind them.
+    // See `TIMING.tournamentReconnectGraceMs`.
+    const graceMs = room.tournament
+      ? TIMING.tournamentReconnectGraceMs
+      : TIMING.reconnectGraceMs;
+
     player.connection = CONNECTION.reconnecting;
-    player.disconnectDeadline = Date.now() + TIMING.reconnectGraceMs;
+    player.disconnectDeadline = Date.now() + graceMs;
 
     void userRepository.touch(userId);
 
@@ -92,7 +100,7 @@ export class PresenceService {
       gameService.onDrawerDisconnected(room);
     }
 
-    timerService.schedule(room, graceTimerName(userId), TIMING.reconnectGraceMs, () => {
+    timerService.schedule(room, graceTimerName(userId), graceMs, () => {
       void this.expire(room, userId).catch((error: unknown) => {
         logger.exception('expiring a disconnected player failed', error, {
           roomId: room.roomId,
@@ -110,6 +118,41 @@ export class PresenceService {
     if (!player || player.socketIds.size > 0 || room.closed) return;
 
     player.connection = CONNECTION.disconnected;
+
+    // In a bracket match the seat is taken over rather than emptied, so the
+    // opponent gets a game instead of a walkover. The player is out either
+    // way; what changes is whether anybody is left to play against.
+    //
+    // A failure here falls through to the ordinary removal below, which is the
+    // behaviour this replaced — the bracket still resolves, via the entry
+    // deadline sweep, so a stand-in that could not be seated costs a match its
+    // second half rather than costing the tournament its progress.
+    if (room.tournament) {
+      const replaced = await tournamentStandInService
+        .replace({
+          room,
+          userId,
+          username: player.username,
+          seatBot: (target, bot) => roomService.seatBot(target, bot),
+        })
+        .catch((error: unknown) => {
+          logger.exception('replacing a disconnected tournament player failed', error, {
+            roomId: room.roomId,
+            userId,
+          });
+          return false;
+        });
+
+      if (replaced) {
+        await chatService.presence(
+          room,
+          `${player.username} disconnected. A bot is playing their turns.`,
+          false,
+        );
+        await gameService.broadcastState(room);
+        return;
+      }
+    }
 
     const { roomEmpty } = await roomService.removePlayer(room, userId);
     await chatService.presence(room, `${player.username} left.`, false);

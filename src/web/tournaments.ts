@@ -24,10 +24,13 @@ import type {
  * the backend, and the API surface simply does not contain the verb.
  */
 
-/** One slot in the listing: the tournament in it, or nothing. */
-export interface TournamentSlotDto {
-  slotNumber: number;
-  tournament: AutoTournamentDto | null;
+/** One day's schedule: at most three tournaments, in the order they happen. */
+export interface TournamentDayDto {
+  /** `YYYY-MM-DD`, in the server's configured zone rather than the browser's. */
+  tournamentDate: string;
+  /** The zone that date and every time on the page are in. */
+  timeZone: string;
+  tournaments: AutoTournamentDto[];
 }
 
 /** Where a match is being played, after asking to enter it. */
@@ -41,19 +44,24 @@ export interface MatchEntryDto {
 }
 
 /**
- * The slots, in order.
+ * Today's tournaments, in the order they happen.
  *
- * Works signed out — the listing is public — and the `viewer` block on each
- * row is simply the anonymous one. A token adds the caller's own state.
+ * Works signed out — the schedule is public — and the `viewer` block on each
+ * row is simply the anonymous one. A token adds the caller's own state, per
+ * tournament, because a player may be in more than one of them.
  */
-export async function fetchTournamentSlots(
+export async function fetchTournamentDay(
   token: string | null,
-): Promise<TournamentSlotDto[]> {
-  const data = await request<{ slots: TournamentSlotDto[] }>(
-    '/api/tournaments',
-    { token: token ?? undefined },
-  );
-  return data.slots ?? [];
+): Promise<TournamentDayDto> {
+  const data = await request<TournamentDayDto>('/api/tournaments', {
+    token: token ?? undefined,
+  });
+
+  return {
+    tournamentDate: data.tournamentDate ?? '',
+    timeZone: data.timeZone ?? 'UTC',
+    tournaments: data.tournaments ?? [],
+  };
 }
 
 /** One tournament, with the caller's own state folded in. */

@@ -8,6 +8,7 @@ import {
   type MatchStatusWire,
   type RegistrationStatusWire,
 } from '@/constants/autoTournament.constants';
+import { env } from '@/config/env';
 import type { AutoTournamentDocument, TournamentRegistrationDocument } from '@/models/AutoTournament';
 import type { TournamentMatchDocument } from '@/models/TournamentMatch';
 import type {
@@ -79,8 +80,9 @@ export function toTournamentDto(input: {
 
   return {
     id: String(row._id),
+    tournamentDate: row.tournamentDate,
+    dailySlot: row.dailySlot as AutoTournamentDto['dailySlot'],
     slotNumber: row.slotNumber,
-    tournamentNumber: row.tournamentNumber,
     name: row.name,
     description: row.description ?? '',
     status: row.status as AutoTournamentDto['status'],
@@ -99,6 +101,10 @@ export function toTournamentDto(input: {
 
     registrationOpenAtMs: row.registrationOpenAt.getTime(),
     registrationCloseAtMs: row.registrationCloseAt.getTime(),
+    botFillAtMs: row.botFillAt ? row.botFillAt.getTime() : null,
+    countdownEndsAtMs: row.countdownEndsAt ? row.countdownEndsAt.getTime() : null,
+    phaseEndsAtMs: phaseDeadline(row),
+    checkInRequired: env.tournament.checkInEnabled,
     checkInOpenAtMs: row.checkInOpenAt.getTime(),
     checkInCloseAtMs: row.checkInCloseAt.getTime(),
     startAtMs: row.startAt.getTime(),
@@ -111,9 +117,102 @@ export function toTournamentDto(input: {
     entryFee: 0,
 
     cancelReason: row.cancelReason ?? null,
+    completedAtMs: row.completedAt ? row.completedAt.getTime() : null,
     viewer,
-    winner: winner ? toParticipantDto(winner, viewerId) : null,
+
+    /**
+     * Who won *this* tournament, and nothing about any other.
+     *
+     * Read from the snapshot on the row, falling back to the live registration
+     * only for a tournament that finished before those fields existed. Both
+     * are scoped to this document, which is the whole of "do not show
+     * tournament 1's winner on tournament 2's card": there is no ambient
+     * winner in this codebase to leak, and no serialiser that could reach one.
+     */
+    winner: winnerSnapshot(row, winner, viewerId),
   };
+}
+
+/**
+ * The winner block, from the snapshot written when the final was decided.
+ *
+ * Falls back to the live registration row for a tournament completed before
+ * the snapshot fields existed, and to null for one that has not finished —
+ * which is every tournament that has not finished, including one whose
+ * *bracket* has a leader. A leader is not a winner and the card must not draw
+ * one as though they were.
+ */
+function winnerSnapshot(
+  row: AutoTournamentDocument,
+  live: TournamentRegistrationDocument | null,
+  viewerId: string | null,
+): TournamentParticipantDto | null {
+  if (row.winnerDisplayName) {
+    const userId = row.winnerUserId ? String(row.winnerUserId) : null;
+
+    return {
+      registrationId: row.winnerRegistrationId ? String(row.winnerRegistrationId) : '',
+      playerId: userId ?? '',
+      displayName: row.winnerDisplayName,
+      avatarId: row.winnerAvatarId ?? 0,
+      avatarColorIndex: row.winnerAvatarColorIndex ?? 0,
+      playerType: row.winnerIsBot ? PLAYER_TYPE.aiBot : PLAYER_TYPE.human,
+      isBot: Boolean(row.winnerIsBot),
+      botDifficulty: null,
+      status: REGISTRATION_STATUS.winner,
+      seed: null,
+      // Both sides required, so a signed-out reader is never told a bot's null
+      // user id is their own.
+      isSelf: Boolean(viewerId && userId && userId === viewerId),
+    };
+  }
+
+  return live ? toParticipantDto(live, viewerId) : null;
+}
+
+/**
+ * The next deadline this tournament is counting down to.
+ *
+ * ## Why the server picks the clock
+ *
+ * Because "which clock" is a question about the lifecycle, and a client that
+ * answered it would be a second implementation of the lifecycle. One number,
+ * always the next thing that will actually happen:
+ *
+ * - `UPCOMING` — when registration opens. The card for tonight's tournament
+ *   shows "joining opens in 4h", which is the next thing a player can *do*.
+ *   The start time is on the row separately, because the card shows both.
+ * - `REGISTRATION` — when the window shuts, which is when check-in opens.
+ * - `CHECK_IN` — when check-in closes, which is the published start.
+ * - `STARTING` — the fast-start countdown, on a deployment that has one.
+ * - Anything else — no clock. A running tournament's timings belong to its
+ *   matches, and a finished one has none.
+ */
+function phaseDeadline(row: AutoTournamentDocument): number | null {
+  if (row.status === AUTO_TOURNAMENT_STATUS.upcoming) {
+    return row.registrationOpenAt.getTime();
+  }
+
+  if (row.status === AUTO_TOURNAMENT_STATUS.starting) {
+    return row.countdownEndsAt ? row.countdownEndsAt.getTime() : null;
+  }
+
+  if (row.status === AUTO_TOURNAMENT_STATUS.registration) {
+    // The bot fill only gets the clock when it is genuinely the next event —
+    // that is, on the fast-start path, where it falls inside the registration
+    // window. Under the daily schedule the seats are filled when check-in
+    // closes, which is the start; showing that here would put a two-hour clock
+    // on a window that shuts in ten minutes.
+    const fillAt = row.botFillAt ? row.botFillAt.getTime() : null;
+    const closeAt = row.registrationCloseAt.getTime();
+
+    if (fillAt !== null && fillAt < closeAt && fillAt > Date.now()) return fillAt;
+    return closeAt;
+  }
+
+  if (row.status === AUTO_TOURNAMENT_STATUS.checkIn) return row.checkInCloseAt.getTime();
+
+  return null;
 }
 
 /**
