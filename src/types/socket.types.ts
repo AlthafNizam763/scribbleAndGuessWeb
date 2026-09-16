@@ -1,5 +1,6 @@
 import type { Server, Socket } from 'socket.io';
 
+import type { BotDifficultyWire } from '@/constants/autoTournament.constants';
 import type { ConnectionWire, GamePhaseWire, WordDifficultyWire } from '@/constants/room.constants';
 import type { AuthenticatedUser } from '@/types/auth.types';
 import type { StrokeDto } from '@/types/drawing.types';
@@ -112,6 +113,40 @@ export interface RuntimePlayer {
 
   /** Which side this player is on. `none` outside a team mode. */
   team: TeamWire;
+
+  /**
+   * Whether this seat is driven by the server rather than by a person.
+   *
+   * ## Why the flag is on the seat and not looked up
+   *
+   * The game engine asks "is this a bot" on paths that must not touch the
+   * database: every broadcast, every turn transition, and the end-of-match
+   * write that decides whose lifetime stats move. A lookup there would put a
+   * query on the hot path, and — worse — a lookup that failed would default to
+   * *human*, which is the direction that puts an AI on the world leaderboard.
+   *
+   * ## What being a bot changes
+   *
+   * Only two things, and neither is inside the rules of play. A bot has no
+   * socket, so nothing is ever sent to it and it cannot be impersonated by one
+   * — there is no connection to impersonate. And a bot is excluded from the
+   * durable writes at the end of a match: lifetime stats, XP, achievements,
+   * streaks and every leaderboard. It still draws, guesses, scores and wins
+   * exactly as a player does, because the engine does not branch on this
+   * anywhere else.
+   */
+  isBot: boolean;
+
+  /**
+   * How hard this bot plays, or null for a person.
+   *
+   * Set by the server when the seat is created and never read from a payload,
+   * so a client cannot make an opponent easier.
+   */
+  botDifficulty: BotDifficultyWire | null;
+
+  /** The bot's profile key, or null for a person. Used for logging and badges. */
+  botId: string | null;
 }
 
 /** One player's per-match tally. Reset whenever the room returns to a lobby. */
@@ -322,6 +357,50 @@ export interface RuntimeRoom {
   /** When the room became empty, or null while somebody is seated. */
   emptySince: number | null;
   closed: boolean;
+
+  /**
+   * The bracket match this room exists to play, or null for an ordinary room.
+   *
+   * ## Why the room knows about the tournament and not the other way round
+   *
+   * Three things have to happen at moments only the room knows about: nobody
+   * outside the pairing may take a seat, the match must start once its
+   * participants are present, and the bracket must be told the result the
+   * instant the engine computes it. All three are room events. Making the room
+   * carry a small, optional back-reference means the game engine's two hooks
+   * are one field test each and cost an ordinary room nothing.
+   *
+   * Everything in it is written by the server when the room is created. There
+   * is no path by which a client can set, clear or change it, which is what
+   * makes "outsiders cannot enter tournament matches" a property of the room
+   * rather than a check somebody has to remember.
+   */
+  tournament: RuntimeTournamentBinding | null;
+
+  /**
+   * Who is allowed to take a seat, or null for a room anybody may join.
+   *
+   * Checked by `roomService.joinRoom` before anything else about membership.
+   * A protected room refuses a stranger even if it has space, is unlocked and
+   * is in its lobby — which is exactly what a bracket match needs and what no
+   * combination of the existing room settings expresses.
+   */
+  allowedUserIds: Set<string> | null;
+}
+
+/** A room's link back to the bracket position it is playing. */
+export interface RuntimeTournamentBinding {
+  tournamentId: string;
+  matchId: string;
+  roundNumber: number;
+  matchNumber: number;
+  /**
+   * The two participants' seat ids, in bracket-slot order.
+   *
+   * Seat ids, not user ids, because one of them may be a bot — and the result
+   * has to be reported back in terms the bracket understands.
+   */
+  registrationIdByPlayerId: Record<string, string>;
 }
 
 /**

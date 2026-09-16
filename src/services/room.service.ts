@@ -5,9 +5,14 @@ import { roomRepository } from '@/repositories/room.repository';
 import { userRepository } from '@/repositories/user.repository';
 import type { AuthenticatedUser } from '@/types/auth.types';
 import type { PlayerDto, RoomDto, RoomSettingsDto } from '@/types/room.types';
+import type { BotDifficultyWire } from '@/constants/autoTournament.constants';
 import { TEAM } from '@/constants/gameModes.constants';
 import { emptyChat, emptyMatchStats } from '@/types/socket.types';
-import type { RuntimePlayer, RuntimeRoom } from '@/types/socket.types';
+import type {
+  RuntimePlayer,
+  RuntimeRoom,
+  RuntimeTournamentBinding,
+} from '@/types/socket.types';
 import { errors } from '@/utils/errors';
 import { generateUniqueRoomCode, normalizeRoomCode } from '@/utils/generateRoomCode';
 import { logger } from '@/utils/logger';
@@ -194,6 +199,10 @@ export class RoomService {
       timers: new Map(),
       emptySince: Date.now(),
       closed: false,
+      // An ordinary room. A bracket match is built by `createProtectedRoom`
+      // below, which is the only thing that ever sets either of these.
+      tournament: null,
+      allowedUserIds: null,
     };
 
     registry.byId.set(roomId, room);
@@ -272,6 +281,10 @@ export class RoomService {
       timers: new Map(),
       emptySince: Date.now(),
       closed: false,
+      // An ordinary room. A bracket match is built by `createProtectedRoom`
+      // below, which is the only thing that ever sets either of these.
+      tournament: null,
+      allowedUserIds: null,
     };
 
     for (const stored of document.players) {
@@ -295,6 +308,15 @@ export class RoomService {
         disconnectDeadline: Date.now() + TIMING.reconnectGraceMs,
         matchStats: emptyMatchStats(),
         team: TEAM.none,
+        // A rehydrated room is always an ordinary one. Bracket matches are not
+        // recovered across a restart — the scheduler re-opens the match rather
+        // than resuming a room whose board and countdown only ever existed in
+        // memory — so there is no bot seat to restore here, and defaulting to
+        // human is the safe direction: a seat wrongly marked as a bot would be
+        // a person quietly denied their own XP.
+        isBot: false,
+        botDifficulty: null,
+        botId: null,
       });
     }
 
@@ -401,11 +423,171 @@ export class RoomService {
       disconnectDeadline: null,
       matchStats: emptyMatchStats(),
       team: TEAM.none,
+      // This path seats a *person*: `user` came from an authenticated socket
+      // or an authenticated request. A bot never arrives here — see
+      // `seatBot` — which is what makes it impossible for a client to obtain
+      // a bot seat, whatever it puts in its payload.
+      isBot: false,
+      botDifficulty: null,
+      botId: null,
     };
 
     room.players.set(user.id, player);
     room.emptySince = null;
     return player;
+  }
+
+  /**
+   * Seats an AI player.
+   *
+   * ## Why this is a separate method and not a flag on `joinRoom`
+   *
+   * `joinRoom` is reachable from a socket and from a REST route; every one of
+   * its arguments ultimately comes from a request. A `isBot` parameter on it
+   * would be one refactor away from being settable by a caller, and the
+   * failure mode is a human seat that scores like a player and is excluded
+   * from the leaderboard — or worse, the reverse.
+   *
+   * This method is not reachable from any handler. It is called by the
+   * tournament match service and by nothing else, with a profile the server
+   * looked up itself. That is the whole of "clients cannot impersonate bots":
+   * not a check, but the absence of a path.
+   *
+   * ## Why a bot is `connected` with no sockets
+   *
+   * `connection` drives the minimum-player rule and the reconnect sweep, and a
+   * bot must count towards the first and be invisible to the second. It holds
+   * no socket ids, so every broadcast helper skips it for free: nothing is
+   * ever sent to a bot, including the word.
+   */
+  seatBot(
+    room: RuntimeRoom,
+    bot: {
+      playerId: string;
+      botId: string;
+      displayName: string;
+      avatarId: number;
+      avatarColorIndex: number;
+      difficulty: BotDifficultyWire;
+    },
+  ): RuntimePlayer {
+    const now = Date.now();
+    const player: RuntimePlayer = {
+      userId: bot.playerId,
+      username: bot.displayName,
+      avatarId: bot.avatarId,
+      avatarColorIndex: bot.avatarColorIndex,
+      score: 0,
+      roundScore: 0,
+      isReady: true,
+      isMuted: false,
+      hasGuessed: false,
+      guessOrder: null,
+      connection: CONNECTION.connected,
+      socketIds: new Set(),
+      joinedAt: now,
+      lastSeenAt: now,
+      disconnectDeadline: null,
+      matchStats: emptyMatchStats(),
+      team: TEAM.none,
+      isBot: true,
+      botDifficulty: bot.difficulty,
+      botId: bot.botId,
+    };
+
+    room.players.set(bot.playerId, player);
+    room.emptySince = null;
+
+    logger.info('bot seated', {
+      roomId: room.roomId,
+      botId: bot.botId,
+      difficulty: bot.difficulty,
+    });
+
+    return player;
+  }
+
+  /**
+   * Creates a room only named players may enter.
+   *
+   * Used by the bracket to open a match. The protection is `allowedUserIds`
+   * rather than the existing `locked` flag or a private setting, because those
+   * two answer different questions — locked stops *new* arrivals including the
+   * ones who are supposed to be here, and private only hides the room from a
+   * listing. This is the one that says who the room is for.
+   *
+   * The host is the first participant. A host is required by the engine — it
+   * is who `startGame` is attributed to — but nothing about a bracket match is
+   * host-driven: the match service starts it on a deadline, so which seat
+   * holds the role has no effect on play.
+   */
+  async createProtectedRoom(input: {
+    ownerId: string;
+    settings: RoomSettingsDto;
+    allowedUserIds: readonly string[];
+    tournament: RuntimeTournamentBinding;
+  }): Promise<RuntimeRoom> {
+    const code = await generateUniqueRoomCode((candidate) =>
+      registry.byCode.has(candidate)
+        ? Promise.resolve(true)
+        : roomRepository.isCodeTaken(candidate),
+    );
+
+    if (!code) {
+      logger.error('exhausted room code attempts for a tournament match');
+      throw errors.internal('Could not allocate a room code. Try again.');
+    }
+
+    const document = await roomRepository.create({
+      roomCode: code,
+      ownerId: input.ownerId,
+      settings: input.settings,
+    });
+
+    const roomId = String(document._id);
+    const room: RuntimeRoom = {
+      roomId,
+      code,
+      hostId: input.ownerId,
+      createdAtMs: Date.now(),
+      settings: input.settings,
+      players: new Map(),
+      bannedIds: new Set(),
+      phase: GAME_PHASE.lobby,
+      gameId: null,
+      totalRounds: input.settings.rounds,
+      currentRound: 0,
+      turnOrder: [],
+      turnIndex: 0,
+      turnNumber: 0,
+      usedWords: new Set(),
+      round: null,
+      board: { strokes: [], redoStack: [] },
+      voteKick: null,
+      voice: { members: new Map() },
+      chat: emptyChat(),
+      spectators: new Map(),
+      locked: false,
+      timers: new Map(),
+      emptySince: Date.now(),
+      closed: false,
+      tournament: input.tournament,
+      allowedUserIds: new Set(input.allowedUserIds),
+    };
+
+    registry.byId.set(roomId, room);
+    registry.byCode.set(code, roomId);
+
+    await this.persist(room);
+
+    logger.info('tournament match room created', {
+      roomId,
+      code,
+      matchId: input.tournament.matchId,
+      tournamentId: input.tournament.tournamentId,
+    });
+
+    return room;
   }
 
   /**
@@ -425,6 +607,24 @@ export class RoomService {
 
     if (room.closed) throw errors.roomNotFound();
     if (room.bannedIds.has(user.id)) throw errors.banned();
+
+    // A bracket match is for its two participants. Checked before the rejoin
+    // branch below, unlike the host's lock, because the two rules differ in
+    // kind: a lock is temporary and its own members must still get back in,
+    // while somebody outside a pairing is *never* a member of that room and
+    // there is no state in which they become one.
+    //
+    // Refused as "not found" rather than "not allowed": a tournament room's
+    // code is guessable in the same way any room code is, and confirming that
+    // a guess named a real match would be the one useful thing to learn from
+    // guessing.
+    if (room.allowedUserIds && !room.allowedUserIds.has(user.id)) {
+      logger.warn('refused an outsider at a tournament match room', {
+        roomId: room.roomId,
+        userId: user.id,
+      });
+      throw errors.roomNotFound();
+    }
 
     const existing = room.players.get(user.id);
     if (existing) {
@@ -675,6 +875,8 @@ export class RoomService {
       isMuted: player.isMuted,
       connection: player.connection,
       team: player.team,
+      isBot: player.isBot,
+      botDifficulty: player.botDifficulty,
     };
   }
 

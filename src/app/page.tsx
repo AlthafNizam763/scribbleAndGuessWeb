@@ -173,6 +173,14 @@ export default function HomePage() {
                 Friends
               </button>
               {/*
+                * The three automatic tournaments. No "create" beside it, and
+                * none anywhere else: the server is the organiser, so the only
+                * verbs a player has are join, check in and enter their match.
+                */}
+              <button type="button" onClick={() => router.push('/tournaments')}>
+                Tournaments
+              </button>
+              {/*
                 * The count is the server's, taken from the last page read or
                 * the last push — never arithmetic on the previous value. See
                 * `unreadNotifications` in the provider for why.

@@ -5,10 +5,13 @@ import { ChatMessage } from '@/models/ChatMessage';
 import { FriendRequest } from '@/models/FriendRequest';
 import { Friendship } from '@/models/Friendship';
 import { Achievement } from '@/models/Achievement';
+import { AutoTournament, TournamentRegistration } from '@/models/AutoTournament';
 import { Game } from '@/models/Game';
 import { Notification } from '@/models/Notification';
 import { Report } from '@/models/Report';
 import { Room } from '@/models/Room';
+import { TournamentBotProfile, TournamentSchedulerLock } from '@/models/TournamentBotProfile';
+import { TournamentMatch, TournamentRound } from '@/models/TournamentMatch';
 import { RoomInvitation } from '@/models/RoomInvitation';
 import { Round } from '@/models/Round';
 import { User } from '@/models/User';
@@ -55,6 +58,16 @@ const asSyncable = (model: unknown): SyncableModel => model as SyncableModel;
 const MODELS: SyncableModel[] = [
   User,
   Room,
+  // The automatic tournament system. Its unique indexes are not an
+  // optimisation — they are what enforces "never a fourth tournament", "one
+  // registration per player" and "one match per bracket position", so a
+  // deployment that skipped them would enforce none of the three.
+  AutoTournament,
+  TournamentRegistration,
+  TournamentRound,
+  TournamentMatch,
+  TournamentBotProfile,
+  TournamentSchedulerLock,
   Game,
   Round,
   Word,
@@ -75,6 +88,11 @@ const MODELS: SyncableModel[] = [
 const PLAY_DATA: SyncableModel[] = [
   User,
   Room,
+  AutoTournament,
+  TournamentRegistration,
+  TournamentRound,
+  TournamentMatch,
+  TournamentSchedulerLock,
   Game,
   Round,
   ChatMessage,

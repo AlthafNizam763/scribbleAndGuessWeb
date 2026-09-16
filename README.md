@@ -603,6 +603,47 @@ XP history rows carry a 90-day TTL. They are a *log* that explains a balance,
 never the balance itself: summing them would make every profile read an
 aggregation and would go wrong the moment a row expired.
 
+### Tournaments
+
+Three knockout tournaments run at all times, organised entirely by the server.
+There is no admin, and there is no create endpoint — not gated, *absent*.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/tournaments` | The three slots, in order. An empty slot is a row with `tournament: null`. |
+| `GET` | `/api/tournaments/active` · `/upcoming` | Narrower reads of the same rows |
+| `GET` | `/api/tournaments/:id` | One tournament, with the caller's own `viewer` state |
+| `POST` · `DELETE` | `/api/tournaments/:id/register` | Join; withdraw (registration window only) |
+| `POST` | `/api/tournaments/:id/check-in` | Confirm you are present, before the draw |
+| `GET` | `/api/tournaments/:id/participants` · `/bracket` · `/leaderboard` | Roster, draw, placements |
+| `POST` | `/api/tournaments/:id/matches/:matchId/enter` | The room code for *your* match |
+| `POST` | `/api/internal/tournaments/scheduler` | One scheduler tick, secret-gated |
+| `GET` | `/api/tournaments/events` | The older *points* tournaments, which moved off the bare path |
+
+**A tournament match is an ordinary room.** The bracket creates one with
+`allowedUserIds` set to the two participants, the existing engine plays it, and
+`endGame`'s standings *are* the result. There is no second game engine and no
+second scoring path.
+
+**AI players fill a short roster**, never a seat a person would have had, and
+never a whole tournament: `minHumanPlayers` is checked before any arithmetic, so
+a bot-only tournament cannot be produced. Bots draw through `drawingService` and
+guess through `submitGuess` — the same code a person's packets go through — and
+are excluded from every durable write at the end of a match, so none of them
+ever reaches a leaderboard.
+
+**The guessing code cannot reach the answer.** Its only input is the same
+`serializeGameState(room, botId)` payload a human guesser receives, in which
+`word` is `null`. It guesses from the blanks and from coarse statistics of the
+shared canvas.
+
+"Exactly three, never four" is a partial unique index on `slotNumber`, not a
+count — so two schedulers racing produce one tournament and a duplicate-key
+error, with no window between a read and a write.
+
+Full write-up, including the socket events, the difficulty table, the deployment
+options and the known limitations: **[`docs/AUTOMATIC_TOURNAMENTS.md`](docs/AUTOMATIC_TOURNAMENTS.md)**.
+
 ### `GET /api/health`
 
 Unauthenticated, so a load balancer probe works. Returns **503** when the

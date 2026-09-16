@@ -19,9 +19,11 @@ import { chatService } from '@/services/chat.service';
 import { hintSchedule, letterCount, maskWord, nextHintIndices } from '@/services/hint.service';
 import { notifyRoomEvent } from '@/services/room.notify';
 import { anomalyService } from '@/services/anomaly.service';
+import { botPlayerService } from '@/services/bot/botPlayer.service';
 import { gameModeService } from '@/services/gameMode.service';
 import { progressionService } from '@/services/progression.service';
 import { tournamentService } from '@/services/tournament.service';
+import { tournamentMatchService } from '@/services/tournament/match.service';
 import { roomService } from '@/services/room.service';
 import { scoringService } from '@/services/scoring.service';
 import { TIMER, timerService } from '@/services/timer.service';
@@ -171,6 +173,15 @@ export class GameService {
   async broadcastState(room: RuntimeRoom): Promise<void> {
     voiceService.reconcile(room);
 
+    // The AI players, brought into line with whatever just changed. Hung here
+    // for exactly the reason `voiceService.reconcile` is: this is the one
+    // funnel every state change already passes through, so there is no list of
+    // call sites that each have to remember to wake the bots — and the one
+    // that was forgotten would be a bot that stopped playing mid-match.
+    //
+    // It costs a room with no bots a walk of its seats and nothing else.
+    botPlayerService.reconcile(room);
+
     const snapshot = roomService.serializeRoom(room);
 
     emitToRoom(room.roomId, SERVER_ROOM_STATE, { room: snapshot });
@@ -185,6 +196,18 @@ export class GameService {
     await emitPerViewer(room.roomId, SERVER_GAME_STATE, (viewerId) => ({
       game: this.serializeGameState(room, viewerId),
     }));
+
+    // A bracket match starts when both of its players are actually here, and
+    // "here" means a socket in this room — which is a fact only this funnel
+    // observes. Fired and forgotten, because starting a match is the *next*
+    // thing that should happen rather than something this broadcast waits on;
+    // guarded inside by a null check on `room.tournament`, so an ordinary room
+    // pays one field test.
+    void tournamentMatchService.onRoomStateChanged(room).catch((error: unknown) => {
+      logger.exception('checking a tournament match for readiness failed', error, {
+        roomId: room.roomId,
+      });
+    });
   }
 
   // ------------------------------------------------- the minimum-player rule
@@ -1106,11 +1129,27 @@ export class GameService {
     // measures time played rather than skill.
     const ranked = gameModeService.isRanked(room);
 
+    /**
+     * The standings, minus the AI players.
+     *
+     * Everything below this line writes something durable about a *person*:
+     * lifetime stats, the world leaderboard, tournament points, XP, streaks
+     * and achievements. A bot has no user row for any of it to land on, and
+     * more to the point it should not have one — an AI in the world rankings
+     * would make the rankings a measurement of how often you were drawn
+     * against a robot.
+     *
+     * Filtered once, here, rather than guarded inside each of the five things
+     * that follow. The seat's own `isBot` flag is the source, so this costs a
+     * map lookup per standing and cannot disagree with what the engine played.
+     */
+    const humanStandings = standings.filter((entry) => !room.players.get(entry.playerId)?.isBot);
+
     if (ranked) {
       // A tie means more than one winner, which is the honest reading of a
       // draw — nobody's record should say they lost.
       await Promise.all(
-        standings.map((entry) =>
+        humanStandings.map((entry) =>
           userRepository.recordGameResult(entry.playerId, {
             scored: entry.score,
             won: entry.rank === 1,
@@ -1127,7 +1166,7 @@ export class GameService {
       // separate tournament scoring, and no endpoint through which a total
       // could be sent.
       await Promise.all(
-        standings.map((entry) =>
+        humanStandings.map((entry) =>
           tournamentService
             .recordMatch({
               userId: entry.playerId,
@@ -1157,7 +1196,7 @@ export class GameService {
     const progression = await progressionService
       .recordMatch({
         room,
-        standings: standings.map((entry) => ({
+        standings: humanStandings.map((entry) => ({
           playerId: entry.playerId,
           score: entry.score,
           won: entry.rank === 1,
@@ -1186,6 +1225,25 @@ export class GameService {
       roomId: room.roomId,
       gameId: room.gameId,
       winnerId: winner?.playerId ?? null,
+    });
+
+    // Every bot in this room is finished. `reconcile` would clear them on the
+    // next broadcast anyway, but a match that ends is exactly the moment a
+    // leaked timer would never be collected, so it is done explicitly.
+    botPlayerService.clearRoom(room.roomId);
+
+    // The bracket, if this room was one. A no-op for an ordinary room: the
+    // first line of the hook is a null check on `room.tournament`.
+    //
+    // Fired and forgotten rather than awaited: advancing a bracket involves
+    // writes and possibly opening the next match's room, and none of that
+    // should be able to delay — or fail — the result the players are already
+    // looking at. The hook is itself idempotent, so a retry is free.
+    void tournamentMatchService.onMatchGameEnded(room, standings).catch((error: unknown) => {
+      logger.exception('reporting a tournament match result failed', error, {
+        roomId: room.roomId,
+        matchId: room.tournament?.matchId,
+      });
     });
 
     // Drop back to the lobby so the host can start again (brief section 48).
@@ -1339,3 +1397,29 @@ function toWordItem(choice: { text: string; category: string; difficulty: string
 }
 
 export const gameService = new GameService();
+
+/**
+ * Hands the engine to the bot driver.
+ *
+ * ## Why the dependency is injected in this direction
+ *
+ * The bots need three things from the engine — the per-viewer game state, word
+ * selection and guess submission — and the engine needs one thing from them,
+ * `reconcile`. Importing both ways would make a cycle whose resolution depends
+ * on which module Node loads first, and the failure mode is a bot driver
+ * holding an undefined engine that silently never plays.
+ *
+ * So the arrow points one way in the imports — this file imports the bots —
+ * and the engine is handed over here, once, at module load. The bot module
+ * imports nothing from this one but a type, which is erased at compile time.
+ */
+botPlayerService.bindEngine(gameService);
+
+/**
+ * And to the bracket, for the same reason.
+ *
+ * The match service needs exactly one thing from the engine — the ability to
+ * start a match once both players are present — and the engine needs one thing
+ * from it, the result hook. Same cycle, same fix.
+ */
+tournamentMatchService.bindEngine(gameService);

@@ -55,6 +55,44 @@ export class WordService {
   }
 
   /**
+   * The words a *guesser* could plausibly name, never empty.
+   *
+   * ## Why this exists beside `pool`
+   *
+   * `pool` answers "what is seeded", and returns nothing when the answer is
+   * nothing. `pickChoices` copes with that by falling back to the built-in
+   * list — so on an unseeded database the drawer is given a word from
+   * `FALLBACK_POOL` while `pool` still reports an empty vocabulary.
+   *
+   * That asymmetry is invisible for a human, who guesses from their own head.
+   * It is not invisible for a bot, which guesses from this list: an empty one
+   * means it silently says nothing for the whole turn. The failure has no
+   * error and no log — the bot simply appears to be broken, which is exactly
+   * how it was found.
+   *
+   * The same fallback, in one place, so the word a turn is played on and the
+   * words a bot may name can never come from different vocabularies.
+   */
+  async guessablePool(settings: RoomSettingsDto): Promise<WordPoolEntry[]> {
+    // The host's custom words replace the pool for the drawer, so they are
+    // what a guesser is actually looking at.
+    const custom = settings.customWords
+      .map((word) => word.trim())
+      .filter((word) => word.length > 0)
+      .map<WordPoolEntry>((word) => ({
+        text: word,
+        category: 'random',
+        difficulty: 'medium',
+        aliases: [],
+      }));
+
+    if (custom.length > 0) return custom;
+
+    const seeded = await this.pool(settings);
+    return seeded.length > 0 ? seeded : FALLBACK_POOL;
+  }
+
+  /**
    * Picks the words to offer the drawer.
    *
    * Words already played this match are excluded, so a three-round game never

@@ -6,13 +6,16 @@ import { GAME_PHASE } from '@/constants/room.constants';
 import { roomChannel, SERVER_TIME_SYNC } from '@/constants/socket.constants';
 import { metrics, registerGauges } from '@/monitoring/metrics';
 import { invitationService } from '@/services/invitation.service';
+import { botPlayerService } from '@/services/bot/botPlayer.service';
 import { presenceService } from '@/services/presence.service';
+import { tournamentBot } from '@/services/tournament/bot.service';
 import { roomService } from '@/services/room.service';
 import { registerChatExtrasHandlers, registerChatHandlers } from '@/socket/chat.socket';
 import { registerDrawingHandlers } from '@/socket/drawing.socket';
 import { registerGameHandlers } from '@/socket/game.socket';
 import { registerPresenceHandlers } from '@/socket/presence.socket';
 import { registerRoomHandlers, registerSpectatorHandlers } from '@/socket/room.socket';
+import { registerTournamentHandlers } from '@/socket/tournament.socket';
 import { registerVoiceHandlers } from '@/socket/voice.socket';
 import { installSocketAuth } from '@/socket/socket.auth';
 import type { GameServer, GameSocket } from '@/types/socket.types';
@@ -80,6 +83,7 @@ export function attachSocketServer(httpServer: HttpServer): GameServer {
     registerChatExtrasHandlers(gameSocket);
     registerSpectatorHandlers(gameSocket);
     registerVoiceHandlers(gameSocket);
+    registerTournamentHandlers(gameSocket);
 
     // Seeds the client's clock estimate immediately, so a countdown is
     // displayable before the first `c:time:ping` round trip completes.
@@ -125,6 +129,23 @@ export function attachSocketServer(httpServer: HttpServer): GameServer {
       void invitationService.expireLapsed();
     }, TIMING.invitationSweepIntervalMs);
     invitations.unref?.();
+
+    // The automatic tournament organiser.
+    //
+    // Started here rather than in `server.ts` because this is the process that
+    // actually holds the rooms: a scheduler that opened a match room in a
+    // process with no socket server would create a room nobody could join.
+    // In the split deployment that means the realtime service runs the
+    // organiser and the REST service does not, which is the right division —
+    // and the `socket-server.ts` entry point calls this same function.
+    //
+    // It takes a distributed lock, so a second instance behind a load balancer
+    // is harmless: one of them does the tick.
+    void tournamentBot.start().catch((error: unknown) => {
+      // A failed start costs tournaments, never the game. The server carries
+      // on serving rooms and the next deploy tries again.
+      logger.exception('failed to start the tournament organiser', error);
+    });
   }
 
   logger.info('socket.io attached');
@@ -180,6 +201,11 @@ function registerRealtimeGauges(io: GameServer): void {
       // The board memory this process is holding. A number that climbs across
       // a load test and never falls is a room that is not being swept.
       strokesHeld,
+      // AI players holding a live drawing or guessing timer. Bounded by
+      // `BOT_LIMITS.maxConcurrentWorkers`, so a number sitting at the ceiling
+      // means bots are being skipped — and one that never falls to zero
+      // between matches means a task is not being cleaned up.
+      botWorkers: botPlayerService.activeWorkers(),
     };
   });
 }

@@ -500,6 +500,115 @@ export const CLIENT_ROOM_LOCK = 'c:room:lock';
 /** Ends the room for everybody. Host only. */
 export const CLIENT_ROOM_END = 'c:room:end';
 
+// --- automatic tournaments --------------------------------------------------
+
+/**
+ * The tournament pushes, each under two names.
+ *
+ * The same two-vocabulary arrangement as `FRIEND_EVENTS` and `ROOM_EVENTS`:
+ * `canonical` is the `s:tournament:*` spelling the rest of this file uses,
+ * `alias` is the flatter `tournament:*` spelling the brief names. Both carry
+ * the same payload, so a client written against either vocabulary works.
+ *
+ * ## Where these are addressed
+ *
+ * Almost all of them are *global*. A tournament is public — the whole point of
+ * the three-slot listing is that anybody can see what is on — so lifecycle
+ * events go to a lobby channel every client may join, and the listing updates
+ * itself without polling. The exceptions are the two that concern one person:
+ * `matchReady` goes to the participants' user channels, because it carries the
+ * room code they are about to enter and nobody else has any business with it.
+ *
+ * ## Why there is no event that changes anything
+ *
+ * These are all announcements. There is no inbound tournament event at all:
+ * registering, checking in and entering a match are REST calls, because each
+ * one has to be refused for reasons a client needs spelled out ("you are
+ * already in a tournament", "check-in has closed"). A fire-and-forget socket
+ * event would have nowhere to put that.
+ */
+export const TOURNAMENT_EVENTS = {
+  /** A tournament was created in a slot. */
+  created: { canonical: 's:tournament:created', alias: 'tournament:created' },
+  /** Registration opened. */
+  registrationOpened: {
+    canonical: 's:tournament:registrationOpened',
+    alias: 'tournament:registration_opened',
+  },
+  /** Somebody registered or withdrew. Carries the new counts. */
+  registrationUpdated: {
+    canonical: 's:tournament:registrationUpdated',
+    alias: 'tournament:registration_updated',
+  },
+  /** Registration closed; registered players must confirm. */
+  checkInOpened: {
+    canonical: 's:tournament:checkInOpened',
+    alias: 'tournament:checkin_opened',
+  },
+  /** Check-in closed. The roster is now final. */
+  checkInClosed: {
+    canonical: 's:tournament:checkInClosed',
+    alias: 'tournament:checkin_closed',
+  },
+  /** The bracket is drawn and play has begun. */
+  started: { canonical: 's:tournament:started', alias: 'tournament:started' },
+  /** The bracket changed: a pairing filled in, or a result landed. */
+  bracketUpdated: {
+    canonical: 's:tournament:bracketUpdated',
+    alias: 'tournament:bracket_updated',
+  },
+  /** A match's room is open. Sent to its two participants only. */
+  matchReady: { canonical: 's:tournament:matchReady', alias: 'tournament:match_ready' },
+  /** A match began. */
+  matchStarted: {
+    canonical: 's:tournament:matchStarted',
+    alias: 'tournament:match_started',
+  },
+  /** A match was decided. */
+  matchCompleted: {
+    canonical: 's:tournament:matchCompleted',
+    alias: 'tournament:match_completed',
+  },
+  /** Every match in a round finished. */
+  roundCompleted: {
+    canonical: 's:tournament:roundCompleted',
+    alias: 'tournament:round_completed',
+  },
+  /** The final was decided. Carries the winner. */
+  completed: { canonical: 's:tournament:completed', alias: 'tournament:completed' },
+  /** The tournament was abandoned, with a reason. */
+  cancelled: { canonical: 's:tournament:cancelled', alias: 'tournament:cancelled' },
+  /** A slot was released and refilled. Carries the replacement. */
+  nextScheduled: {
+    canonical: 's:tournament:nextScheduled',
+    alias: 'tournament:next_scheduled',
+  },
+  /** An AI player was added to a roster. */
+  botAdded: { canonical: 's:tournament:botAdded', alias: 'tournament:bot_added' },
+  /** An AI player's state changed — seated in a match, eliminated. */
+  botStatusUpdated: {
+    canonical: 's:tournament:botStatusUpdated',
+    alias: 'tournament:bot_status_updated',
+  },
+} as const satisfies Record<string, { canonical: string; alias: string }>;
+
+export type TournamentEventName = keyof typeof TOURNAMENT_EVENTS;
+
+/**
+ * The channel every tournament announcement fans out to.
+ *
+ * A single named channel rather than `io.emit`, for the same reason the clock
+ * broadcast is: a global fan-out reaches every socket in the process including
+ * the ones mid-round, who have no use for it. A client joins this when it
+ * opens the tournament screen and leaves when it closes.
+ */
+export const TOURNAMENT_LOBBY_CHANNEL = 'tournaments:lobby';
+
+/** Subscribes the caller to the tournament lobby channel. */
+export const CLIENT_TOURNAMENT_WATCH = 'c:tournament:watch';
+/** Unsubscribes the caller. */
+export const CLIENT_TOURNAMENT_UNWATCH = 'c:tournament:unwatch';
+
 /** The gallery changed. Sent to the room. */
 export const SERVER_ROOM_SPECTATORS = 's:room:spectators';
 /** Every spectator was removed, with a reason. */

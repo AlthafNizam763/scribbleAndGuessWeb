@@ -97,6 +97,57 @@ const schema = z.object({
   WEBRTC_TURN_URL: z.string().default(''),
   WEBRTC_TURN_USERNAME: z.string().default(''),
   WEBRTC_TURN_CREDENTIAL: z.string().default(''),
+
+  /**
+   * The automatic tournament organiser.
+   *
+   * ## Why the slot count is configurable but capped
+   *
+   * The product rule is three, and three is the default. It is a variable
+   * rather than a constant so a staging deployment can run one slot and a load
+   * test can run more — but it is bounded, because each slot is a bracket, a
+   * set of rooms and a pool of bot workers, and an operator typing a large
+   * number would quietly commit this process to running all of them.
+   */
+  TOURNAMENT_SLOT_COUNT: z.coerce.number().int().min(1).max(10).default(3),
+  TOURNAMENT_MIN_PLAYERS: z.coerce.number().int().min(2).max(16).default(4),
+  TOURNAMENT_MAX_PLAYERS: z.coerce.number().int().min(2).max(16).default(16),
+  TOURNAMENT_MIN_HUMAN_PLAYERS: z.coerce.number().int().min(1).max(16).default(1),
+  TOURNAMENT_MAX_BOTS: z.coerce.number().int().min(0).max(15).default(3),
+  TOURNAMENT_ALLOW_BOTS: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  TOURNAMENT_BOT_DIFFICULTY: z.enum(['EASY', 'NORMAL', 'HARD']).default('NORMAL'),
+
+  /** Registration and check-in windows, in minutes. */
+  TOURNAMENT_REGISTRATION_MINUTES: z.coerce.number().min(1).max(240).default(10),
+  TOURNAMENT_CHECKIN_MINUTES: z.coerce.number().min(1).max(60).default(2),
+
+  /**
+   * Whether this process runs the scheduler loop itself.
+   *
+   * Off is the external-cron deployment: something outside calls
+   * `POST /api/internal/tournaments/scheduler` and this process only serves
+   * requests. On is the single-service deployment, where the loop runs here.
+   * Both are safe at once — the distributed lock means a tick from either
+   * source excludes the other — so this is about not paying for a timer you
+   * are not using rather than about correctness.
+   */
+  TOURNAMENT_SCHEDULER_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+
+  /**
+   * The shared secret on the internal scheduler endpoint.
+   *
+   * Empty refuses every call in production — an unauthenticated endpoint that
+   * creates and cancels tournaments is not something to leave open by default.
+   * In development an empty secret allows the call, so the loop can be driven
+   * by hand without configuration.
+   */
+  TOURNAMENT_SCHEDULER_SECRET: z.string().default(''),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -160,6 +211,33 @@ export const env = {
   webrtcTurnUrls: splitUrls(raw.WEBRTC_TURN_URL),
   webrtcTurnUsername: raw.WEBRTC_TURN_USERNAME,
   webrtcTurnCredential: raw.WEBRTC_TURN_CREDENTIAL,
+
+  /**
+   * The automatic tournament organiser's configuration.
+   *
+   * Grouped into one object rather than spread across the top level because
+   * every consumer wants the whole policy at once: a tournament is created by
+   * copying this block onto the row, so that a tournament already taking
+   * registrations keeps the rules it advertised even if this changes.
+   *
+   * `maxPlayers` is floored at `minPlayers` rather than validated apart from
+   * it: a deployment that set a minimum above its maximum would otherwise
+   * create tournaments that can never legally start, and failing to boot over
+   * a transposed pair of numbers helps nobody.
+   */
+  tournament: {
+    slotCount: raw.TOURNAMENT_SLOT_COUNT,
+    minPlayers: raw.TOURNAMENT_MIN_PLAYERS,
+    maxPlayers: Math.max(raw.TOURNAMENT_MAX_PLAYERS, raw.TOURNAMENT_MIN_PLAYERS),
+    minHumanPlayers: Math.min(raw.TOURNAMENT_MIN_HUMAN_PLAYERS, raw.TOURNAMENT_MIN_PLAYERS),
+    maxBots: raw.TOURNAMENT_MAX_BOTS,
+    allowBots: raw.TOURNAMENT_ALLOW_BOTS,
+    botDifficulty: raw.TOURNAMENT_BOT_DIFFICULTY,
+    registrationMs: Math.round(raw.TOURNAMENT_REGISTRATION_MINUTES * 60_000),
+    checkInMs: Math.round(raw.TOURNAMENT_CHECKIN_MINUTES * 60_000),
+    schedulerEnabled: raw.TOURNAMENT_SCHEDULER_ENABLED,
+    schedulerSecret: raw.TOURNAMENT_SCHEDULER_SECRET,
+  },
 } as const;
 
 /** Splits a comma-separated URL list, dropping blanks. */

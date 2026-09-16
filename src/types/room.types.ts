@@ -41,6 +41,22 @@ export interface PlayerDto {
 
   /** Which side this player is on. `none` outside a team mode. */
   team: string;
+
+  /**
+   * Whether this seat is an AI player.
+   *
+   * Sent on every player in every room snapshot, not only in tournament
+   * matches, so a client renders the badge from what it was given rather than
+   * from context it has to work out. False for everybody in an ordinary room.
+   *
+   * This is the "do not show AI bots as real humans" rule at the protocol
+   * level: a client that ignores it is choosing to, rather than lacking the
+   * information.
+   */
+  isBot: boolean;
+
+  /** `EASY`, `NORMAL` or `HARD` for a bot; null for a person. */
+  botDifficulty: string | null;
 }
 
 /** `lib/models/room_settings.dart`. */

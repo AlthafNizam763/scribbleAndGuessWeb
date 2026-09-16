@@ -35,6 +35,13 @@ export function makePlayer(overrides: Partial<RuntimePlayer> & { userId: string 
     joinedAt: Date.now(),
     lastSeenAt: Date.now(),
     disconnectDeadline: null,
+    // A person unless a test says otherwise. The engine reads `isBot` on the
+    // end-of-match path, and a missing field there would read as undefined —
+    // falsy, and therefore accidentally right, which is exactly the kind of
+    // accident a helper should not leave lying around.
+    isBot: false,
+    botDifficulty: null,
+    botId: null,
     ...overrides,
   };
 }
@@ -92,6 +99,8 @@ export function makeRoom(
     timers: new Map(),
     emptySince: null,
     closed: false,
+    tournament: null,
+    allowedUserIds: null,
     ...rest,
   };
 
