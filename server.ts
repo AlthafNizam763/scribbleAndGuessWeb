@@ -6,6 +6,8 @@ import next from 'next';
 import { connectToDatabase, disconnectFromDatabase, watchDatabaseEvents } from '@/config/database';
 import { env } from '@/config/env';
 import { getSocketServer } from '@/config/socket';
+import { metrics } from '@/monitoring/metrics';
+import { watchMongoCommands } from '@/monitoring/mongoMonitor';
 import { attachSocketServer } from '@/socket/socket.server';
 import { logger } from '@/utils/logger';
 
@@ -34,6 +36,11 @@ async function main(): Promise<void> {
 
   // Connect before listening: a server that accepts requests it cannot serve
   // just turns every early call into a confusing 500.
+  // Event-loop sampling starts before anything else so the boot itself is
+  // inside the measurement: a slow start is a signal too.
+  metrics.start();
+  watchMongoCommands();
+
   watchDatabaseEvents();
   await connectToDatabase();
 

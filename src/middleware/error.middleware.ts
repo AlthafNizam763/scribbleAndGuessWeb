@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
+
 import { NextResponse } from 'next/server';
 import { ZodError } from 'zod';
 
+import { metrics } from '@/monitoring/metrics';
 import { AppError, ErrorCode, type ErrorPayload } from '@/utils/errors';
 import { logger } from '@/utils/logger';
 
@@ -82,13 +85,67 @@ export function withErrorHandling<Args extends unknown[]>(
   handler: (request: Request, ...args: Args) => Promise<NextResponse> | NextResponse,
 ): (request: Request, ...args: Args) => Promise<NextResponse> {
   return async (request: Request, ...args: Args): Promise<NextResponse> => {
+    const startedAt = performance.now();
+    const path = new URL(request.url).pathname;
+    const requestId = readOrMintRequestId(request);
+
+    let response: NextResponse;
     try {
-      return await handler(request, ...args);
+      response = await handler(request, ...args);
     } catch (error) {
-      return toErrorResponse(error, {
-        method: request.method,
-        path: new URL(request.url).pathname,
-      });
+      response = toErrorResponse(error, { method: request.method, path, requestId });
     }
+
+    // The route *pattern*, not the path: `/api/rooms/:id` rather than one
+    // series per room id. An unbounded metric label is how a metrics system
+    // becomes the leak it was installed to find.
+    metrics.observeHttp(
+      routePattern(path),
+      request.method,
+      response.status,
+      performance.now() - startedAt,
+    );
+
+    // Echoed so a client, a log line and a proxy access log can all be lined
+    // up against one request when something goes wrong.
+    response.headers.set('x-request-id', requestId);
+    return response;
   };
+}
+
+/**
+ * The caller's request id, or a fresh one.
+ *
+ * Honouring an inbound `x-request-id` is what makes a trace survive a proxy or
+ * a client retry: the same identifier appears on every hop rather than a new
+ * one per service. It is echoed into logs and back in the response, never used
+ * for anything but correlation, and length-capped because it arrives from
+ * outside and ends up in a log line.
+ */
+function readOrMintRequestId(request: Request): string {
+  const inbound = request.headers.get('x-request-id')?.trim();
+  if (inbound && inbound.length > 0) return inbound.slice(0, 64);
+  return randomUUID();
+}
+
+/**
+ * Collapses a concrete path into the route pattern that produced it.
+ *
+ * Ids in this app are Mongo ObjectIds, five-character room codes, or numeric
+ * turn numbers, so each is recognisable by shape. Anything unrecognised is
+ * left alone — a genuinely new path segment should show up as itself once
+ * rather than be silently folded into something it is not.
+ */
+const OBJECT_ID = /^[0-9a-f]{24}$/i;
+const ROOM_CODE = /^[A-Z0-9]{5}$/;
+
+export function routePattern(path: string): string {
+  const segments = path.split('/').map((segment) => {
+    if (OBJECT_ID.test(segment)) return ':id';
+    if (ROOM_CODE.test(segment)) return ':code';
+    if (/^\d+$/.test(segment)) return ':n';
+    return segment;
+  });
+
+  return segments.join('/');
 }

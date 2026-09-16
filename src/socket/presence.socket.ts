@@ -6,6 +6,7 @@ import {
   roomChannel,
 } from '@/constants/socket.constants';
 import { parsePayload } from '@/middleware/validation.middleware';
+import { metrics } from '@/monitoring/metrics';
 import { drawingService } from '@/services/drawing.service';
 import { gameService } from '@/services/game.service';
 import { presenceService } from '@/services/presence.service';
@@ -175,6 +176,12 @@ async function seat(socket: GameSocket, roomId: string): Promise<void> {
   }
 
   presenceService.attach(room, socket.data.user.id, socket.id);
+
+  // The brief's reconnect count. Incremented here rather than on every socket
+  // connection because this is the path that actually *restored* somebody to a
+  // seat they still held — a fresh sign-in is a connection, not a reconnect,
+  // and conflating the two would make the figure describe app launches.
+  metrics.increment('socket.reconnects.restored');
 
   // A reconnect counts towards the minimum exactly as a fresh join does, so a
   // match paused by this player's departure comes back when they do.

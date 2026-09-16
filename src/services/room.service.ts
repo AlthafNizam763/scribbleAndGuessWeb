@@ -41,6 +41,22 @@ interface Registry {
   byId: Map<string, RuntimeRoom>;
   /** Room code (upper case) to room id, so a join is a lookup not a scan. */
   byCode: Map<string, string>;
+  /**
+   * Hydrations currently in flight, by room id.
+   *
+   * `hydrate` reads the registry, misses, awaits Mongo and then writes the
+   * room it built. Two callers racing that — two players reconnecting to the
+   * same room after a restart, which is exactly when a restart produces a
+   * burst of reconnects — both miss, both build a `RuntimeRoom`, and the
+   * second write replaces the first. Any player seated on the first object is
+   * then in a room nothing points at any more: their socket is in the channel,
+   * the registry disagrees, and they are invisible to everybody.
+   *
+   * Parking the promise here closes the window. The first caller does the
+   * work, every other caller awaits the same result, and they all end up
+   * holding one room object.
+   */
+  hydrating: Map<string, Promise<RuntimeRoom | null>>;
 }
 
 const globalRegistry = globalThis as typeof globalThis & {
@@ -50,7 +66,12 @@ const globalRegistry = globalThis as typeof globalThis & {
 const registry: Registry = (globalRegistry.__scribbleRooms ??= {
   byId: new Map(),
   byCode: new Map(),
+  hydrating: new Map(),
 });
+
+// A registry cached from before this field existed — a hot reload across the
+// change — would carry the first two maps and not this one.
+registry.hydrating ??= new Map();
 
 /** The default settings a room starts with. */
 export function defaultSettings(): RoomSettingsDto {
@@ -198,8 +219,32 @@ export class RoomService {
     const existing = this.get(roomId);
     if (existing) return existing;
 
+    // Somebody else is already rebuilding this room. Awaiting their result is
+    // what stops two callers each building one and the second discarding the
+    // first — see the note on `Registry.hydrating`.
+    const pending = registry.hydrating.get(roomId);
+    if (pending) return pending;
+
+    const attempt = this.hydrateOnce(roomId).finally(() => {
+      registry.hydrating.delete(roomId);
+    });
+
+    registry.hydrating.set(roomId, attempt);
+    return attempt;
+  }
+
+  /** The actual rebuild. Only ever one of these in flight per room. */
+  private async hydrateOnce(roomId: string): Promise<RuntimeRoom | null> {
     const document = await roomRepository.findById(roomId);
     if (!document || document.closedAt) return null;
+
+    // The read above is the only await, but it is long enough for `createRoom`
+    // to have registered this very room in the meantime. Handing back what is
+    // in the registry rather than replacing it keeps the live object — and
+    // anybody already seated on it — rather than the one just rebuilt from a
+    // document that is now behind.
+    const raced = this.get(roomId);
+    if (raced) return raced;
 
     const room: RuntimeRoom = {
       roomId,

@@ -19,7 +19,10 @@
     "test:e2e:voice": "tsx tests/e2e.voice.ts",
     "dev:socket": "cross-env NODE_ENV=development tsx watch socket-server.ts",
     "build:socket": "tsc --project tsconfig.server.json && tsc-alias --project tsconfig.server.json",
-    "start:socket": "cross-env NODE_ENV=production node dist/socket-server.js"
+    "start:socket": "cross-env NODE_ENV=production node dist/socket-server.js",
+    "loadtest": "cross-env NODE_ENV=development tsx loadtest/run.ts",
+    "loadtest:stack": "tsx loadtest/server.ts",
+    "loadtest:full": "tsx loadtest/server.ts --run"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -38,6 +41,7 @@
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.10.7",
     "@types/react": "^19.0.7",
+    "mongodb-memory-server": "^11.2.0",
     "socket.io-client": "^4.8.1",
     "tsc-alias": "^1.9.4",
     "tsx": "^4.19.2",

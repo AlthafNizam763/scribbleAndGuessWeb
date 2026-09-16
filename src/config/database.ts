@@ -82,12 +82,35 @@ export async function connectToDatabase(): Promise<typeof mongoose> {
         // server: a request should return a 503 in seconds, not hang.
         serverSelectionTimeoutMS: 8000,
         socketTimeoutMS: 45_000,
-        maxPoolSize: 20,
-        minPoolSize: 2,
+        /**
+         * Sized from a measured burst rather than from a round number.
+         *
+         * A load run of a hundred concurrent players produced 3,500 commands,
+         * of which 247 took over 200ms — and the slow ones were ordinary
+         * indexed reads. Nothing about those queries is slow; they were
+         * *queueing*, because the burst pattern this app has is a hundred
+         * clients doing the same thing in the same second, and twenty
+         * connections means eighty of them wait.
+         *
+         * Fifty absorbs that burst while staying well inside what a small
+         * Atlas tier permits (an M10 allows 1,500) and well inside the
+         * per-process budget for a couple of instances behind a load balancer.
+         * Raising it further would not help: past the point where the pool is
+         * no longer the constraint, more connections only move contention into
+         * the database.
+         */
+        maxPoolSize: 50,
+        minPoolSize: 5,
         // Buffering hides connection problems by holding operations until a
         // connection appears. With it off, a query against a down database
         // throws immediately and the error handler reports it honestly.
         bufferCommands: false,
+        // Emits `commandSucceeded` / `commandFailed` on the client, which is
+        // what `monitoring/mongoMonitor.ts` times queries and detects slow ones
+        // from. The driver documents the overhead as negligible: it is an
+        // event emission per command on a path that has already done a network
+        // round trip.
+        monitorCommands: true,
       })
       .then((instance) => {
         logger.info('mongo connected', { database: instance.connection.name });

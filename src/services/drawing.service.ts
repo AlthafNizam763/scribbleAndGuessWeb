@@ -8,7 +8,7 @@ import {
   type DrawToolWire,
 } from '@/constants/room.constants';
 import type { PointTuple, StrokeDto } from '@/types/drawing.types';
-import type { RuntimeRoom } from '@/types/socket.types';
+import type { RuntimeBoard, RuntimeRoom } from '@/types/socket.types';
 import { errors } from '@/utils/errors';
 
 /**
@@ -133,15 +133,44 @@ export class DrawingService {
   }
 
   /**
+   * The board's id index, rebuilt when it has fallen out of step.
+   *
+   * A length disagreement is the cheap, reliable signal that something other
+   * than this service touched `strokes` — a fresh board from the game engine,
+   * or a test pushing a stroke directly. Rebuilding then rather than trusting
+   * the map is what keeps the index an optimisation rather than a second
+   * source of truth that can disagree with the first.
+   */
+  private index(board: RuntimeBoard): Map<string, StrokeDto> {
+    let index = board.index;
+    if (!index || index.size !== board.strokes.length) {
+      index = new Map(board.strokes.map((stroke) => [stroke.id, stroke]));
+      board.index = index;
+    }
+    return index;
+  }
+
+  /**
    * Starts a stroke on the board.
    *
    * A new stroke invalidates the redo stack, exactly as it does in any editor:
    * once you draw something new, the thing you undid is gone for good.
+   *
+   * A stroke id already on the board is refused. Two strokes sharing an id
+   * would make `append` ambiguous — the batch could belong to either — and
+   * would break the index's one invariant, that it holds exactly as many
+   * entries as `strokes` has elements. Losing that invariant would send every
+   * subsequent append back through a full rebuild, which is a way to turn the
+   * fix below into the very scan it removes.
    */
   begin(room: RuntimeRoom, stroke: StrokeDto): boolean {
     if (room.board.strokes.length >= INPUT_LIMITS.maxStrokesPerBoard) return false;
 
+    const index = this.index(room.board);
+    if (index.has(stroke.id)) return false;
+
     room.board.strokes.push(stroke);
+    index.set(stroke.id, stroke);
     room.board.redoStack = [];
     return true;
   }
@@ -155,7 +184,7 @@ export class DrawingService {
    * will work normally.
    */
   append(room: RuntimeRoom, strokeId: string, points: PointTuple[]): boolean {
-    const stroke = room.board.strokes.find((candidate) => candidate.id === strokeId);
+    const stroke = this.index(room.board).get(strokeId);
     if (!stroke) return false;
 
     // A shape is its two points and a fill is none; neither has anything to
@@ -179,13 +208,22 @@ export class DrawingService {
     return true;
   }
 
-  /** Removes the drawer's most recent stroke and remembers it for redo. */
+  /**
+   * Removes the drawer's most recent stroke and remembers it for redo.
+   *
+   * Still a reverse scan: "the last stroke *this user* authored" is a question
+   * about paint order, which the id index does not answer. It costs nothing to
+   * leave it — undo is one button press, not seventeen messages a second.
+   */
   undo(room: RuntimeRoom, userId: string): StrokeDto | null {
+    const index = this.index(room.board);
+
     for (let i = room.board.strokes.length - 1; i >= 0; i--) {
       const stroke = room.board.strokes[i]!;
       if (stroke.a !== userId) continue;
 
       room.board.strokes.splice(i, 1);
+      index.delete(stroke.id);
       room.board.redoStack.push(stroke);
       return stroke;
     }
@@ -197,7 +235,9 @@ export class DrawingService {
     const stroke = room.board.redoStack.pop();
     if (!stroke) return null;
 
+    const index = this.index(room.board);
     room.board.strokes.push(stroke);
+    index.set(stroke.id, stroke);
     return stroke;
   }
 
@@ -205,6 +245,7 @@ export class DrawingService {
   clear(room: RuntimeRoom): void {
     room.board.strokes = [];
     room.board.redoStack = [];
+    room.board.index = new Map();
   }
 
   /**

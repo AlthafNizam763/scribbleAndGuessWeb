@@ -79,6 +79,73 @@ export interface QuickPlayOutcome {
  */
 const inFlight = new Set<string>();
 
+/**
+ * The tail of the matchmaking queue.
+ *
+ * ## The bug this exists to fix
+ *
+ * The per-user gate above stops one player double-tapping into two rooms. It
+ * does nothing about *different* players racing, and under a simultaneous
+ * burst that is the far worse failure. A load run of eighty-eight players all
+ * tapping Play in the same tick produced **seventy-six rooms** — very nearly
+ * one each — where eleven would have held them all.
+ *
+ * The mechanism is an ordinary check-then-act across an `await`. `run` reads
+ * the block list before it ranks, and that read yields the event loop. Every
+ * one of the eighty-eight callers reaches the yield before any of them has
+ * created anything, so when they resume they each rank a registry that is
+ * still empty, find no candidate, and go on to create. The rooms they make are
+ * invisible to each other because they were all decided before any of them
+ * existed.
+ *
+ * It is not a cosmetic problem. A room needs `MIN_PLAYERS_TO_START` people, so
+ * seventy-six rooms of one is seventy-six players who cannot start a game —
+ * exactly the "Quick Play does not create unnecessary duplicate rooms"
+ * criterion, failing in the case it was written for.
+ *
+ * ## Why a queue rather than a cleverer check
+ *
+ * The decision "is there a seat for this player, or must I open a room" is
+ * only meaningful against a registry nobody else is mutating. Re-checking
+ * after creating does not help — by then the room exists and the damage is a
+ * room that should not have been opened. Retrying on a miss is the same race
+ * one loop iteration later.
+ *
+ * So the decision is serialised: callers queue, and each one ranks a registry
+ * that already contains every room the callers ahead of it created. The
+ * critical section is small — an in-memory ranking plus a seat, both
+ * synchronous — and only the first player into each new room pays for a room
+ * creation. Eleven creations serialised is a few hundred milliseconds across
+ * the whole burst, against a matchmaker that otherwise does not match.
+ *
+ * The expensive part of the call, the block-list read, is deliberately left
+ * *outside* the queue: it depends on nothing the queue protects, and holding a
+ * lock across a database round trip would turn a burst into a stampede of
+ * waiting.
+ */
+let queue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Runs `work` after everything already queued, whether or not those failed.
+ *
+ * The `.then(onFulfilled, onRejected)` pair is what makes a rejection ahead in
+ * the queue not poison everything behind it: a player whose matchmaking threw
+ * must not wedge the queue for every player after them.
+ */
+function serialised<T>(work: () => Promise<T>): Promise<T> {
+  const result = queue.then(work, work);
+  queue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+/** Empties the matchmaking queue. Used by tests. */
+export function resetMatchmakingQueue(): void {
+  queue = Promise.resolve();
+}
+
 export class MatchmakingService {
   /**
    * The whole Quick Play flow: reuse, match, or create.
@@ -103,19 +170,94 @@ export class MatchmakingService {
     // Already seated somewhere live? Hand that room back rather than moving
     // them. A player who taps Play from a screen they reached mid-game should
     // land back where they were, not be pulled out of a match in progress.
+    //
+    // Answered before queueing, because it is a synchronous registry read that
+    // needs no coordination and returning it immediately keeps a second tap
+    // off the queue entirely.
     const existing = this.roomOf(user.id);
     if (existing) {
       logger.debug('quick play: already seated', { userId: user.id, roomId: existing.roomId });
       return { room: existing, created: false, alreadySeated: true };
     }
 
+    // Outside the queue on purpose: a database round trip held under a lock
+    // would make every waiting player pay for it. See the note on `queue`.
     const blocked = new Set(await blockRepository.relatedIds(user.id));
 
-    // Every candidate, best first, so a room that fills underneath us can be
-    // abandoned for the next one instead of failing the whole request.
-    const candidates = this.rankCandidates(user.id, blocked);
+    // Not queued here. `matchOrCreate` takes the queue itself, and only around
+    // the part that needs it — queueing at both levels would have the outer
+    // call holding the queue while the inner one waits for it to drain, which
+    // is a deadlock that waits forever rather than an obvious failure.
+    return this.matchOrCreate(user, blocked);
+  }
 
-    for (const room of candidates) {
+  /**
+   * Rank, seat, or open a room — one caller at a time.
+   *
+   * Everything in here reads or writes the live registry, which is why it runs
+   * under the queue. The awaits it does contain are the ones that *must* be
+   * inside: `joinRoom` commits the seat synchronously before its first await,
+   * and `createRoom` has to have registered the room before the next caller
+   * ranks, or that caller opens a second one for the same reason this method
+   * exists.
+   */
+  private async matchOrCreate(
+    user: AuthenticatedUser,
+    blocked: Set<string>,
+  ): Promise<QuickPlayOutcome> {
+    // The fast path, deliberately outside the queue.
+    //
+    // Joining an existing room needs no coordination: `joinRoom` checks
+    // capacity and takes the seat with no `await` between the two, so on a
+    // single-threaded loop that pair is already atomic and two callers cannot
+    // both take the last seat. Only the decision to *create* is racy. Keeping
+    // the ordinary case — a player tapping Play while rooms are waiting — off
+    // the queue entirely is what stops the fix for a launch-burst problem
+    // becoming a queue every player joins for the rest of the session.
+    const matched = await this.tryJoinCandidate(user, blocked);
+    if (matched) return { room: matched, created: false, alreadySeated: false };
+
+    // Nothing was waiting. That conclusion is only trustworthy while nobody
+    // else is creating, so the rest happens one caller at a time.
+    return serialised(async () => {
+      // A player can be seated by an invitation accepted while they waited.
+      const seatedMeanwhile = this.roomOf(user.id);
+      if (seatedMeanwhile) {
+        return { room: seatedMeanwhile, created: false, alreadySeated: true };
+      }
+
+      // Re-ranked under the queue, because a caller ahead may have just opened
+      // exactly the room this one was about to duplicate. This retry is the
+      // whole fix: without it every caller in a burst reaches `createRoom`.
+      const late = await this.tryJoinCandidate(user, blocked);
+      if (late) return { room: late, created: false, alreadySeated: false };
+
+      const room = await roomService.createRoom({
+        owner: user,
+        settings: quickPlaySettings(),
+      });
+
+      logger.info('quick play: opened a room', {
+        userId: user.id,
+        roomId: room.roomId,
+        code: room.code,
+      });
+
+      return { room, created: true, alreadySeated: false };
+    });
+  }
+
+  /**
+   * Seats the player in the best room that will take them, or returns null.
+   *
+   * Candidates are walked best first, so a room that fills underneath us is
+   * abandoned for the next one instead of failing the whole request.
+   */
+  private async tryJoinCandidate(
+    user: AuthenticatedUser,
+    blocked: Set<string>,
+  ): Promise<RuntimeRoom | null> {
+    for (const room of this.rankCandidates(user.id, blocked)) {
       try {
         await roomService.joinRoom({ room, user });
         logger.info('quick play: matched', {
@@ -124,7 +266,7 @@ export class MatchmakingService {
           code: room.code,
           seated: room.players.size,
         });
-        return { room, created: false, alreadySeated: false };
+        return room;
       } catch (error) {
         // The room filled, started or closed between ranking and joining.
         // That is the ordinary race this loop exists for; anything else is a
@@ -140,18 +282,7 @@ export class MatchmakingService {
       }
     }
 
-    const room = await roomService.createRoom({
-      owner: user,
-      settings: quickPlaySettings(),
-    });
-
-    logger.info('quick play: opened a room', {
-      userId: user.id,
-      roomId: room.roomId,
-      code: room.code,
-    });
-
-    return { room, created: true, alreadySeated: false };
+    return null;
   }
 
   /**

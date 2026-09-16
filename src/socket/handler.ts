@@ -5,6 +5,7 @@ import {
   enforceSocketLimit,
   type RateLimitName,
 } from '@/middleware/rateLimit.middleware';
+import { metrics } from '@/monitoring/metrics';
 import { roomService } from '@/services/room.service';
 import type { Ack, AckFn, GameSocket, RuntimeRoom } from '@/types/socket.types';
 import { AppError, ErrorCode } from '@/utils/errors';
@@ -112,6 +113,9 @@ export function on(
     const payload = ack ? args[args.length - 2] : last;
 
     void (async () => {
+      const startedAt = performance.now();
+      let failed = true;
+
       try {
         if (options.limit) enforceSocketLimit(socket, options.limit);
 
@@ -129,6 +133,7 @@ export function on(
           payload ?? {},
         );
 
+        failed = false;
         safeAck(ack, { ok: true, ...(result ?? {}) });
       } catch (error) {
         if (!AppError.isAppError(error) && !(error instanceof ZodError)) {
@@ -156,6 +161,15 @@ export function on(
         }
 
         if (!ack) socket.emit(SERVER_ERROR, { error: response.error });
+      } finally {
+        // In a `finally` because the catch block above returns early on three
+        // separate paths, and an event that failed in one of those is exactly
+        // the event worth having a measurement of.
+        //
+        // `event` is the canonical constant, not anything from the payload, so
+        // the label set is fixed at the number of handlers this server
+        // registers and cannot be grown by a client.
+        metrics.observeSocketEvent(event, performance.now() - startedAt, failed);
       }
     })();
   };

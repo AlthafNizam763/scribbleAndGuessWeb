@@ -72,6 +72,16 @@ const schema = z.object({
   SOCKET_URL: z.string().default('http://localhost:3000'),
 
   CORS_ORIGIN: z.string().default('*'),
+
+  /**
+   * Shared secret required to read `/api/metrics` and `/metrics`.
+   *
+   * Empty — the default — leaves the endpoint open, which is right for a probe
+   * on a private network and for reading numbers during a load test. Set it on
+   * a deployment whose metrics endpoint is reachable from the internet: the
+   * payload names no user, but it does describe how loaded the deployment is.
+   */
+  METRICS_TOKEN: z.string().default(''),
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
 
   /**
@@ -140,6 +150,9 @@ export const env = {
   corsOrigins: raw.CORS_ORIGIN === '*' ? '*' : raw.CORS_ORIGIN.split(',').map((o) => o.trim()),
 
   logLevel: raw.LOG_LEVEL,
+
+  /** Gate on the metrics endpoints. Empty means no gate. */
+  metricsToken: raw.METRICS_TOKEN,
 
   /** STUN URLs, in preference order. Empty disables STUN entirely. */
   webrtcStunUrls: splitUrls(raw.WEBRTC_STUN_URL),

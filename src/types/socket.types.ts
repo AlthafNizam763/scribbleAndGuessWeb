@@ -144,6 +144,22 @@ export interface RuntimeBoard {
   strokes: StrokeDto[];
   /** Strokes the drawer undid, newest last. Cleared by any new stroke. */
   redoStack: StrokeDto[];
+  /**
+   * `strokes` keyed by id, so `c:draw:append` is a lookup rather than a scan.
+   *
+   * Append runs about seventeen times a second per drawer and has to find the
+   * stroke the batch belongs to. Searching `strokes` for it is O(n) against an
+   * array that grows all turn — at the four-thousand-stroke ceiling that is a
+   * four-thousand-element scan seventeen times a second, per room.
+   *
+   * Optional, and rebuilt by `DrawingService` whenever it disagrees with
+   * `strokes` in length. That is what lets every other construction site — and
+   * the test helpers, which push strokes directly — stay as they are: a board
+   * built without an index simply grows one on first use, and a board mutated
+   * behind this service's back is detected and re-indexed rather than silently
+   * answering with stale strokes.
+   */
+  index?: Map<string, StrokeDto>;
 }
 
 /** An open vote-kick poll (brief section 45). */

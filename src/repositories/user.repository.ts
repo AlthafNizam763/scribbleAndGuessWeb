@@ -1,6 +1,7 @@
 import { Types } from 'mongoose';
 
 import { User, type UserDocument } from '@/models/User';
+import { forgetWorldLeaderboard } from '@/services/leaderboard.cache';
 import { maskProfanity } from '@/utils/wordFilter';
 import type { AuthProvider } from '@/types/auth.types';
 
@@ -117,6 +118,12 @@ export const userRepository = {
         $set: { lastSeenAt: new Date() },
       },
     ).exec();
+
+    // Every number the world board ranks by just moved. Dropping the cached
+    // pages here rather than waiting out their TTL is what lets a player who
+    // has just finished a match pull to refresh and see the standing they
+    // changed.
+    forgetWorldLeaderboard();
   },
 
   /**

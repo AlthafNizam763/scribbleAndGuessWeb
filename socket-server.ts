@@ -3,6 +3,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { connectToDatabase, databaseStatus, disconnectFromDatabase, watchDatabaseEvents } from '@/config/database';
 import { env } from '@/config/env';
 import { getSocketServer } from '@/config/socket';
+import { metrics } from '@/monitoring/metrics';
+import { watchMongoCommands } from '@/monitoring/mongoMonitor';
 import { roomService } from '@/services/room.service';
 import { attachSocketServer } from '@/socket/socket.server';
 import { logger } from '@/utils/logger';
@@ -79,6 +81,61 @@ function handleHealth(response: ServerResponse): void {
 }
 
 /**
+ * The realtime process's metrics (brief section 11).
+ *
+ * This is the process that matters for a load test — it holds the sockets, the
+ * rooms and the boards — so its event-loop delay, socket counts and per-event
+ * latencies are the numbers worth reading. The REST deployment serves the same
+ * shape from `src/app/api/metrics/route.ts`, describing its own process.
+ *
+ * Gated by `METRICS_TOKEN` when one is set, exactly as the REST route is. The
+ * payload carries no user, room code or word.
+ */
+function handleMetrics(request: IncomingMessage, response: ServerResponse): void {
+  const expected = env.metricsToken.trim();
+
+  if (expected.length > 0) {
+    const header = request.headers['x-metrics-token'];
+    const bearer = String(request.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+    const presented = (Array.isArray(header) ? header[0] : header) ?? bearer;
+
+    if (!timingSafeEqual(String(presented ?? ''), expected)) {
+      response.writeHead(401, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify({
+          success: false,
+          error: { code: 'UNAUTHORIZED', message: 'Not authorised.' },
+        }),
+      );
+      return;
+    }
+  }
+
+  response.writeHead(200, {
+    'content-type': 'application/json',
+    // A cached metric is a wrong metric.
+    'cache-control': 'no-store',
+  });
+  response.end(JSON.stringify(metrics.snapshot()));
+}
+
+/**
+ * Compares two strings without returning early on the first difference.
+ *
+ * The lengths are folded into the comparison rather than checked first, so a
+ * caller cannot learn the token's length by timing a mismatch.
+ */
+function timingSafeEqual(a: string, b: string): boolean {
+  let difference = a.length ^ b.length;
+
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    difference |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+
+  return difference === 0;
+}
+
+/**
  * Everything this process serves over plain HTTP.
  *
  * Socket.IO installs its own listener for `/socket.io/` ahead of this, so by
@@ -91,6 +148,11 @@ function handleHttp(request: IncomingMessage, response: ServerResponse): void {
 
   if (path === '/healthz' || path === '/health' || path === '/api/health' || path === '/') {
     handleHealth(response);
+    return;
+  }
+
+  if (path === '/metrics' || path === '/api/metrics') {
+    handleMetrics(request, response);
     return;
   }
 
@@ -109,6 +171,11 @@ function handleHttp(request: IncomingMessage, response: ServerResponse): void {
 async function main(): Promise<void> {
   // Connect before listening: a server that accepts sockets it cannot
   // authenticate just turns every handshake into a confusing failure.
+  // Event-loop sampling starts before anything else so the boot itself is
+  // inside the measurement: a slow start is a signal too.
+  metrics.start();
+  watchMongoCommands();
+
   watchDatabaseEvents();
   await connectToDatabase();
 

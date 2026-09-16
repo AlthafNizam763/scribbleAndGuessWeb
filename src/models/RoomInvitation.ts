@@ -107,6 +107,37 @@ roomInvitationSchema.index({ roomId: 1, status: 1 });
 /** The sweeper's scan: pending rows whose deadline has passed. */
 roomInvitationSchema.index({ status: 1, expiresAt: 1 });
 
+/**
+ * Mongo's own sweeper, deleting a row an hour after it stopped being useful.
+ *
+ * ## Why this is not the same thing as the application sweeper
+ *
+ * `invitationService.expireLapsed()` moves a lapsed invitation from `pending`
+ * to `expired`. That is a *status* change, and it has to happen promptly
+ * because it is what releases the unique-index slot so the same friend can be
+ * invited to that room again. This index does not do that job and cannot
+ * replace it: it only deletes.
+ *
+ * What it adds is the other half — rows that are answered, rejected or expired
+ * still sit in the collection forever, and nothing reads them. An invitation is
+ * not history anybody looks at; the notification it produced is its own row
+ * with its own TTL. So they are deleted.
+ *
+ * ## Why an hour past `expiresAt`, not at it
+ *
+ * Deleting exactly at the deadline would race the accept path, which reads the
+ * row and *then* compares `expiresAt` in order to answer `Invitation expired`
+ * rather than `Not found`. A player tapping a stale invitation should be told
+ * it lapsed, not told it never existed. An hour of margin makes that
+ * impossible to hit, and Mongo's TTL monitor only runs once a minute anyway,
+ * so a tighter figure would be false precision.
+ *
+ * Accepted and rejected rows are deleted on the same clock. They carry the
+ * same `expiresAt` they were created with, so they leave an hour after the
+ * invitation would have lapsed regardless of how quickly it was answered.
+ */
+roomInvitationSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 60 * 60 });
+
 export type RoomInvitationDocument = InferSchemaType<typeof roomInvitationSchema> & {
   _id: Types.ObjectId;
 };

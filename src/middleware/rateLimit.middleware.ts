@@ -1,4 +1,5 @@
 import { errors } from '@/utils/errors';
+import { logger } from '@/utils/logger';
 import type { GameSocket } from '@/types/socket.types';
 
 /**
@@ -31,6 +32,17 @@ import type { GameSocket } from '@/types/socket.types';
 interface Bucket {
   tokens: number;
   updatedAt: number;
+  /**
+   * Which rule this bucket spends from.
+   *
+   * Only the HTTP map needs it, and only to evict safely: a full bucket is
+   * indistinguishable from an absent one and is therefore free to drop, but
+   * "full" is a property of *this* bucket's rule. Socket buckets are keyed by
+   * rule name in a per-connection map and discarded with the connection, so
+   * they never need it — it is optional rather than required so those stay a
+   * two-field object.
+   */
+  rule?: RateLimitName;
 }
 
 export interface RateLimitRule {
@@ -230,19 +242,59 @@ export function enforceHttpLimit(name: RateLimitName, identity: string): void {
 
   let bucket = httpBuckets.get(key);
   if (!bucket) {
-    bucket = { tokens: rule.burst, updatedAt: now };
+    bucket = { tokens: rule.burst, updatedAt: now, rule: name };
     httpBuckets.set(key, bucket);
   }
 
   if (!spend(bucket, rule, now)) throw errors.rateLimited();
 
-  // Keep the map from growing without bound on a long-lived process. Full
-  // buckets are indistinguishable from absent ones, so dropping them is free.
-  if (httpBuckets.size > 10_000) {
-    for (const [candidateKey, candidate] of httpBuckets) {
-      if (candidate.tokens >= RATE_LIMITS.action.burst) httpBuckets.delete(candidateKey);
-      if (httpBuckets.size <= 5000) break;
-    }
+  if (httpBuckets.size > HTTP_BUCKET_CEILING) evictFullBuckets(now);
+}
+
+/** When the HTTP map is swept, and how far down. */
+const HTTP_BUCKET_CEILING = 10_000;
+const HTTP_BUCKET_TARGET = 5_000;
+
+/**
+ * Drops buckets that have refilled, keeping the map from growing without bound.
+ *
+ * A bucket at its rule's burst has no memory of anything — recreating it on the
+ * next request produces exactly the same object — so dropping it is free.
+ *
+ * ## Why each bucket is measured against its own rule
+ *
+ * This used to compare every bucket against `RATE_LIMITS.action.burst`, which
+ * is 20. A `guess` bucket holds at most 8 tokens, `chat` 6, `guestLogin` 5:
+ * none of them can ever reach 20, so none of them was ever evicted. A map that
+ * filled with those would scan all ten thousand entries, delete nothing, and
+ * then do it again on the very next request — the map grew without bound *and*
+ * every request got slower. Comparing against `RATE_LIMITS[candidate.rule]`
+ * is what makes the sweep actually reclaim.
+ *
+ * Buckets are refilled before being measured, because a bucket sitting idle
+ * since its last spend is full in every sense that matters and only looks
+ * partial because nothing has touched it since.
+ */
+function evictFullBuckets(now: number): void {
+  for (const [key, bucket] of httpBuckets) {
+    const rule = bucket.rule ? RATE_LIMITS[bucket.rule] : RATE_LIMITS.action;
+
+    const elapsedSeconds = (now - bucket.updatedAt) / 1000;
+    const tokens = Math.min(rule.burst, bucket.tokens + elapsedSeconds * rule.perSecond);
+
+    if (tokens >= rule.burst) httpBuckets.delete(key);
+    if (httpBuckets.size <= HTTP_BUCKET_TARGET) return;
+  }
+
+  // Every remaining bucket is mid-refill, so none of them is free to drop and
+  // the map is legitimately this large — a burst of genuinely active callers.
+  // Clearing it anyway would hand every one of them a fresh allowance, which
+  // is the opposite of what a rate limiter is for, so it is left alone and
+  // reported instead.
+  if (httpBuckets.size > HTTP_BUCKET_CEILING) {
+    logger.warn('rate limit buckets above ceiling after a sweep', {
+      size: httpBuckets.size,
+    });
   }
 }
 
