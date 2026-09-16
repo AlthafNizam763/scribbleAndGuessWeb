@@ -156,6 +156,40 @@ export const RATE_LIMITS = {
    * by tapping through it.
    */
   notificationAction: { burst: 30, perSecond: 2 },
+  /**
+   * Reading levels, XP history and the achievement catalogue.
+   *
+   * All reads, and the catalogue is a constant — the only database work is one
+   * user row and one small collection scan per call. Generous accordingly; the
+   * sustained rate exists to stop a client polling a progress bar.
+   */
+  progressionRead: { burst: 20, perSecond: 2 },
+  /**
+   * Reading drawing replays.
+   *
+   * Tighter than the other reads because one response can be the largest
+   * payload this API serves — a whole turn's strokes. The burst covers a
+   * player stepping through a match's turns one after another; the sustained
+   * rate makes pulling every drawing off the server in a loop slow enough to
+   * be pointless.
+   */
+  replayRead: { burst: 10, perSecond: 0.5 },
+  /**
+   * Typing notifications.
+   *
+   * The chattiest event in the protocol and the cheapest — it is relayed and
+   * nothing else. Generous enough that a fast typist never trips it, bounded
+   * so a client cannot turn a keystroke stream into a broadcast storm.
+   */
+  typing: { burst: 20, perSecond: 3 },
+  /**
+   * Reacting to and deleting messages.
+   *
+   * Deliberately *not* the `guess` bucket the send handler shares. A player
+   * reacting to a funny line must not spend the tokens they need to guess
+   * with, or a room enjoying itself would find it could no longer play.
+   */
+  chatAction: { burst: 15, perSecond: 2 },
   /** Anything else with an ack. */
   action: { burst: 20, perSecond: 5 },
 } as const satisfies Record<string, RateLimitRule>;

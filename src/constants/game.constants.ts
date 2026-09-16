@@ -17,6 +17,18 @@ export const ROOM_DEFAULTS = {
   hintCount: 2,
   wordSelectSeconds: 15,
   allowVoteKick: true,
+  /** Whether guessers may talk to each other. The drawer never can. */
+  voiceEnabled: true,
+  /** Whether the text channel is open. Guesses are never affected. */
+  chatEnabled: true,
+  /** Which rule set the match runs under. */
+  gameMode: 'classic',
+  /** Whether people may watch once the seats are full. */
+  allowSpectators: true,
+  /** Whether only the host's friends may join by code. */
+  friendsOnly: false,
+  /** Narrows the word pool. Null means the mode or the room decides. */
+  wordDifficulty: null,
   isPrivate: false,
 } as const;
 
@@ -138,4 +150,60 @@ export const INPUT_LIMITS = {
   maxPointsPerBatch: 200,
   /** How many chat lines are kept in memory per room. */
   chatHistoryLimit: 200,
+  /** How many recent messages a live room keeps addressable for reactions. */
+  chatIndexLimit: 80,
+  /** How long a typing indicator stands before the client forgets it. */
+  typingTtlMs: 4000,
+} as const;
+
+/**
+ * Bounds on what a turn's replay may cost to store and to send.
+ *
+ * ## Why the live limits are not enough
+ *
+ * `maxStrokesPerBoard` and `maxPointsPerStroke` bound what one *room* can hold
+ * in memory while a turn runs, and they are generous because the board is
+ * transient — it is thrown away when the turn ends. The snapshot is the
+ * opposite: it is written to Mongo, kept for the life of the match, and read
+ * back in full by every client that opens a replay. At the live ceiling a
+ * single turn could persist four thousand strokes of two thousand points, and
+ * a twelve-turn match would be measured in tens of megabytes of documents
+ * nobody could load.
+ *
+ * ## What is given up when a drawing is over budget
+ *
+ * Points, never strokes. Dropping a stroke removes something the drawer drew;
+ * dropping every other *point within* a stroke removes only smoothness, and
+ * the replay's curve-smoothing puts most of that back. So compaction thins
+ * long strokes and leaves the drawing's content intact — see
+ * `replay.service.ts`.
+ */
+export const REPLAY_LIMITS = {
+  /**
+   * Total points kept across a whole turn's snapshot.
+   *
+   * Sized from what a turn can realistically contain: eighty seconds of
+   * continuous drawing at the client's sampling rate is a few thousand points,
+   * so a normal drawing is never touched. Only the outliers are.
+   */
+  maxPointsPerSnapshot: 12_000,
+  /** Points kept in any one stroke of a snapshot, before the global budget. */
+  maxPointsPerStroke: 600,
+  /**
+   * Strokes kept in a snapshot.
+   *
+   * Far below the live ceiling, and the one limit that *does* discard content —
+   * so it is set where no human drawing reaches it. A turn with more than this
+   * is a script, and the replay keeps the earliest strokes rather than a
+   * random slice so what it shows is still a drawing in progress.
+   */
+  maxStrokesPerSnapshot: 1_200,
+  /**
+   * The longest gap a replay will sit through between two strokes, in ms.
+   *
+   * A drawer who stops to think for twenty seconds should not make everybody
+   * watching the replay wait twenty seconds. Gaps longer than this are shown
+   * as this.
+   */
+  maxIdleGapMs: 1_200,
 } as const;

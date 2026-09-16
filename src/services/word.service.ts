@@ -4,6 +4,7 @@ import type { RoomSettingsDto } from '@/types/room.types';
 import { normalizeGuess } from '@/utils/normalizeGuess';
 import { sample, shuffled } from '@/utils/random';
 import { logger } from '@/utils/logger';
+import { containsProfanity } from '@/utils/wordFilter';
 
 /**
  * Word selection and hints (brief sections 20, 22 and 34).
@@ -71,9 +72,14 @@ export class WordService {
   }): Promise<(WordPoolEntry & { aliases: string[] })[]> {
     const { settings, usedWords, count } = input;
 
+    // Custom words go through the same profanity mask as chat. A host cannot
+    // be allowed to make the whole room draw a slur, and unlike chat there is
+    // nobody to report afterwards — the word simply would not have been in
+    // the game. Refused at the source rather than masked, because a starred
+    // word is not drawable.
     const custom = settings.customWords
       .map((word) => word.trim())
-      .filter((word) => word.length > 0)
+      .filter((word) => word.length > 0 && !containsProfanity(word))
       .map<WordPoolEntry>((word) => ({
         text: word,
         category: 'random',
@@ -91,8 +97,23 @@ export class WordService {
       return sample(FALLBACK_POOL, count);
     }
 
-    const fresh = pool.filter((entry) => !usedWords.has(normalizeGuess(entry.text)));
-    const source = fresh.length >= count ? fresh : pool;
+    // The difficulty filter, which is what makes Challenge mode Challenge.
+    //
+    // Narrowed *before* the freshness filter and relaxed independently of it,
+    // because the two failures are different: running out of hard words should
+    // fall back to the whole pool rather than to hard words already played.
+    const byDifficulty =
+      settings.wordDifficulty === null || settings.wordDifficulty === undefined
+        ? pool
+        : pool.filter((entry) => entry.difficulty === settings.wordDifficulty);
+
+    // A narrowed pool too small to fill a turn is dropped rather than offering
+    // fewer choices: a word bank thin in one difficulty should degrade into
+    // mixed difficulty, not into a broken turn.
+    const eligible = byDifficulty.length >= count ? byDifficulty : pool;
+
+    const fresh = eligible.filter((entry) => !usedWords.has(normalizeGuess(entry.text)));
+    const source = fresh.length >= count ? fresh : eligible;
 
     return sample(source, Math.min(count, source.length));
   }

@@ -5,11 +5,11 @@ import { TIMING } from '@/constants/game.constants';
 import { SERVER_TIME_SYNC } from '@/constants/socket.constants';
 import { invitationService } from '@/services/invitation.service';
 import { presenceService } from '@/services/presence.service';
-import { registerChatHandlers } from '@/socket/chat.socket';
+import { registerChatExtrasHandlers, registerChatHandlers } from '@/socket/chat.socket';
 import { registerDrawingHandlers } from '@/socket/drawing.socket';
 import { registerGameHandlers } from '@/socket/game.socket';
 import { registerPresenceHandlers } from '@/socket/presence.socket';
-import { registerRoomHandlers } from '@/socket/room.socket';
+import { registerRoomHandlers, registerSpectatorHandlers } from '@/socket/room.socket';
 import { registerVoiceHandlers } from '@/socket/voice.socket';
 import { installSocketAuth } from '@/socket/socket.auth';
 import type { GameServer, GameSocket } from '@/types/socket.types';
@@ -42,6 +42,8 @@ export function attachSocketServer(httpServer: HttpServer): GameServer {
     registerGameHandlers(gameSocket);
     registerDrawingHandlers(gameSocket);
     registerChatHandlers(gameSocket);
+    registerChatExtrasHandlers(gameSocket);
+    registerSpectatorHandlers(gameSocket);
     registerVoiceHandlers(gameSocket);
 
     // Seeds the client's clock estimate immediately, so a countdown is

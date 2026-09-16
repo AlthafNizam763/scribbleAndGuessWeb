@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
 import { INPUT_LIMITS } from '@/constants/game.constants';
+import {
+  PROFILE_FRAMES,
+  PROFILE_LIMITS,
+  PROFILE_THEMES,
+} from '@/constants/social.constants';
 
 /**
  * Auth validation (brief sections 5, 7 and 8).
@@ -51,6 +56,24 @@ export const updateProfileSchema = z
     username: usernameSchema.optional(),
     avatarId: avatarIdSchema.optional(),
     avatarColorIndex: avatarColorSchema.optional(),
+
+    /**
+     * A short self-description.
+     *
+     * Masked rather than refused if it trips the profanity filter — see
+     * `userRepository.updateProfile`. An empty string clears it.
+     */
+    bio: z.string().trim().max(PROFILE_LIMITS.maxBioLength).optional(),
+
+    /**
+     * Cosmetics, as keys from closed sets.
+     *
+     * An unrecognised key is coerced to the default rather than refused: a
+     * client offering a frame this server has retired should still be able to
+     * save the rest of its profile.
+     */
+    profileFrame: z.enum(PROFILE_FRAMES).catch('none').optional(),
+    profileTheme: z.enum(PROFILE_THEMES).catch('paper').optional(),
   })
   .refine((body) => Object.keys(body).length > 0, {
     message: 'Send a username or an avatar to change.',

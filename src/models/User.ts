@@ -1,7 +1,12 @@
 import { Schema, model, models, type InferSchemaType, type Model } from 'mongoose';
 
 import { INPUT_LIMITS } from '@/constants/game.constants';
-import { LOCALITY_LIMITS } from '@/constants/social.constants';
+import {
+  LOCALITY_LIMITS,
+  PROFILE_LIMITS,
+  USER_ROLE,
+  USER_ROLES,
+} from '@/constants/social.constants';
 
 /**
  * A player account (brief section 5).
@@ -51,12 +56,58 @@ const userSchema = new Schema(
     /** Password hash. Never selected by default; only the auth service asks. */
     passwordHash: { type: String, default: null, select: false },
 
+    /**
+     * What this account may do beyond playing.
+     *
+     * There is deliberately no endpoint that writes this. A self-service path
+     * to moderator is a self-service path to reading everybody's reports, so
+     * the field is changed in the database and nowhere else — and it is read
+     * from the row on every privileged request rather than carried in a token,
+     * so revoking access takes effect on the next call instead of in thirty
+     * days when the token expires.
+     */
+    role: {
+      type: String,
+      enum: USER_ROLES,
+      default: USER_ROLE.player,
+      required: true,
+    },
+
     authProvider: {
       type: String,
       enum: ['guest', 'google', 'apple', 'email'],
       required: true,
       default: 'guest',
     },
+
+    /**
+     * A short self-description, shown on the profile.
+     *
+     * Masked rather than refused if it contains profanity — see
+     * `user.service.ts`. Bounded hard because it is the one free-text field an
+     * account carries, and the only one a stranger can read.
+     */
+    bio: { type: String, trim: true, maxlength: PROFILE_LIMITS.maxBioLength, default: '' },
+
+    /**
+     * Cosmetic choices, stored as keys rather than as colours or assets.
+     *
+     * A client that could store its own hex value would be storing arbitrary
+     * strings on a public profile; a key can only ever name something this
+     * build ships. Unknown keys render as the default, so retiring a frame
+     * does not break the accounts wearing it.
+     */
+    profileFrame: { type: String, trim: true, maxlength: 32, default: 'none' },
+    profileTheme: { type: String, trim: true, maxlength: 32, default: 'paper' },
+
+    /**
+     * The category this player has drawn or guessed most.
+     *
+     * Denormalised because working it out means grouping every round they
+     * appeared in — an aggregation across the whole `rounds` collection to
+     * render one line on a profile.
+     */
+    favoriteCategory: { type: String, trim: true, maxlength: 32, default: null },
 
     lastSeenAt: { type: Date, default: Date.now },
 
@@ -72,6 +123,61 @@ const userSchema = new Schema(
     gamesWon: { type: Number, default: 0, min: 0 },
     totalScore: { type: Number, default: 0, min: 0 },
     bestRoundScore: { type: Number, default: 0, min: 0 },
+
+    /**
+     * The counters the achievement catalogue watches.
+     *
+     * ## Why they live here and not in their own collection
+     *
+     * Every one of them is read together, on the same path, for the same
+     * player: the end-of-match evaluation needs all of them at once and would
+     * otherwise be a join. They are also all monotonic — each only ever goes
+     * up — which is what makes re-evaluating an achievement safe. A threshold
+     * once crossed stays crossed, so a repeated evaluation awards nothing new,
+     * and the unique index on `achievements` catches the race where two
+     * evaluations run at once.
+     *
+     * Written the same way the stats above are: by the game engine, with
+     * `$inc`, and refused outright by `PATCH /api/users/me`. A client that
+     * could set its own `correctGuesses` could award itself every achievement
+     * in the catalogue.
+     */
+    correctGuesses: { type: Number, default: 0, min: 0 },
+    /** Correct guesses that were the *first* of their turn. */
+    firstGuesses: { type: Number, default: 0, min: 0 },
+    /** Correct guesses inside the opening fraction of a turn. */
+    fastGuesses: { type: Number, default: 0, min: 0 },
+    /** Turns drawn where every eligible guesser got it. */
+    perfectDrawings: { type: Number, default: 0, min: 0 },
+    /** Turns taken as the drawer, finished rather than abandoned. */
+    drawingTurns: { type: Number, default: 0, min: 0 },
+
+    /**
+     * Consecutive wins.
+     *
+     * `currentWinStreak` is the only field in this block that can go *down* —
+     * a loss resets it to zero — which is exactly why the achievement watches
+     * `bestWinStreak` instead. An achievement keyed on a resettable counter
+     * could be lost after being earned, and re-earned, and awarded twice.
+     */
+    currentWinStreak: { type: Number, default: 0, min: 0 },
+    bestWinStreak: { type: Number, default: 0, min: 0 },
+
+    /** Counters for achievements whose features are not built yet. */
+    dailyChallengesCompleted: { type: Number, default: 0, min: 0 },
+    tournamentsWon: { type: Number, default: 0, min: 0 },
+
+    /**
+     * Experience, and the level derived from it.
+     *
+     * `xp` is the authority; `level` is denormalised from it by
+     * `levelForXp` on every award. Storing both looks redundant and is not:
+     * the leaderboard and the profile list need to sort and filter by level
+     * without recomputing a power function per row, and the two cannot drift
+     * because nothing writes `level` except the one service that writes `xp`.
+     */
+    xp: { type: Number, default: 0, min: 0 },
+    level: { type: Number, default: 1, min: 1 },
 
     /**
      * Where the player plays from, for the locality leaderboard.

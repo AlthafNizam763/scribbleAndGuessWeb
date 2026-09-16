@@ -1,6 +1,7 @@
 import type { Types } from 'mongoose';
 
 import { Round, type RoundDocument } from '@/models/Round';
+import { compactSnapshot } from '@/utils/compactSnapshot';
 import { isObjectId } from '@/repositories/user.repository';
 import type { WordDifficultyWire } from '@/constants/room.constants';
 import type { StrokeDto } from '@/types/drawing.types';
@@ -95,17 +96,39 @@ export const roundRepository = {
     },
   ): Promise<void> {
     if (!isObjectId(roundId)) return;
+
+    // Thinned before it is written, not when it is read. The snapshot is
+    // stored once and read many times, so the budget belongs on the write —
+    // and a document that was never allowed to grow cannot later be too big to
+    // load. See `compactSnapshot` for why points are thinned and strokes are
+    // not.
+    const { strokes } = compactSnapshot(input.snapshot);
+
     await Round.updateOne(
       { _id: roundId },
       {
         $set: {
           scoreDeltas: input.scoreDeltas,
-          snapshot: input.snapshot,
+          snapshot: strokes,
           endReason: input.endReason,
           endedAt: new Date(),
         },
       },
     ).exec();
+  },
+
+  /**
+   * One turn of one match.
+   *
+   * Keyed by (game, turn) rather than by round id because that is what a
+   * client actually holds: the round result names a turn, and nothing in
+   * the protocol ever puts a round document id on the wire. The pair is
+   * unique and indexed, so this is a point lookup.
+   */
+  async findByGameTurn(gameId: string, turnNumber: number) {
+    if (!isObjectId(gameId)) return null;
+    if (!Number.isInteger(turnNumber) || turnNumber < 1) return null;
+    return Round.findOne({ gameId, turnNumber }).lean().exec();
   },
 
   async findByGame(gameId: string) {

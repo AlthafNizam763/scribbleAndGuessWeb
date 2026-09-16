@@ -102,11 +102,83 @@ export function DrawCanvas({ canDraw }: { canDraw: boolean }) {
       // The eraser is white rather than a composite operation, because the
       // board it paints on is always white — and `destination-out` would punch
       // a hole showing the page behind it instead.
-      context.strokeStyle = stroke.t === 'eraser' ? '#ffffff' : cssColor(stroke.c);
-      context.lineWidth = Math.max(1, stroke.w * scale);
+      const base = stroke.t === 'eraser' ? '#ffffff' : cssColor(stroke.c);
+
+      // A fill covers the canvas and has neither geometry nor width. Not a
+      // flood fill of an enclosed region — see `FILL_TOOLS` on the server for
+      // why that could not replay identically across clients.
+      if (stroke.t === 'fill') {
+        context.fillStyle = base;
+        context.fillRect(0, 0, w, h);
+        continue;
+      }
+
+      // Translucency is applied here rather than baked into the stored colour,
+      // so one swatch means one colour whichever tool picked it up.
+      context.globalAlpha =
+        stroke.t === 'marker' ? 0.45 : stroke.t === 'pencil' ? 0.75 : 1;
+      context.lineCap = stroke.t === 'marker' ? 'square' : 'round';
+      context.lineJoin = stroke.t === 'marker' ? 'miter' : 'round';
+
+      context.strokeStyle = base;
+      const nominalWidth = Math.max(1, stroke.w * scale);
+      context.lineWidth = nominalWidth;
 
       const first = stroke.p[0];
       if (!first) continue;
+
+      // Shapes are two points: the drag's start and end.
+      if (stroke.t === 'line' || stroke.t === 'rectangle' || stroke.t === 'circle') {
+        const second = stroke.p[1];
+        if (!second) continue;
+
+        const x0 = first[0] * w;
+        const y0 = first[1] * h;
+        const x1 = second[0] * w;
+        const y1 = second[1] * h;
+
+        context.beginPath();
+        if (stroke.t === 'line') {
+          context.moveTo(x0, y0);
+          context.lineTo(x1, y1);
+        } else if (stroke.t === 'rectangle') {
+          context.rect(x0, y0, x1 - x0, y1 - y0);
+        } else {
+          context.ellipse(
+            (x0 + x1) / 2,
+            (y0 + y1) / 2,
+            Math.abs(x1 - x0) / 2,
+            Math.abs(y1 - y0) / 2,
+            0,
+            0,
+            Math.PI * 2,
+          );
+        }
+        context.stroke();
+        context.globalAlpha = 1;
+        continue;
+      }
+
+      // The brush varies its width with the pressure recorded per point, so it
+      // is drawn as one segment per pair — a path carries a single width for
+      // its whole length. Confined to the one tool that needs it.
+      if (stroke.t === 'brush' && stroke.p.length > 1) {
+        for (let i = 1; i < stroke.p.length; i += 1) {
+          const from = stroke.p[i - 1];
+          const to = stroke.p[i];
+          if (!from || !to) continue;
+
+          const pressure = ((from[2] ?? 0.5) + (to[2] ?? 0.5)) / 2;
+          context.lineWidth = nominalWidth * (0.4 + pressure * 1.2);
+
+          context.beginPath();
+          context.moveTo(from[0] * w, from[1] * h);
+          context.lineTo(to[0] * w, to[1] * h);
+          context.stroke();
+        }
+        context.globalAlpha = 1;
+        continue;
+      }
 
       context.beginPath();
       context.moveTo(first[0] * w, first[1] * h);
@@ -122,6 +194,7 @@ export function DrawCanvas({ canDraw }: { canDraw: boolean }) {
       }
 
       context.stroke();
+      context.globalAlpha = 1;
     }
   }, [strokes]);
 

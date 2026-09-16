@@ -408,3 +408,101 @@ export const NOTIFICATION_EVENTS = {
 } as const satisfies Record<string, { canonical: string; alias: string }>;
 
 export type NotificationEventName = keyof typeof NOTIFICATION_EVENTS;
+
+// --- progression ------------------------------------------------------------
+
+/**
+ * The XP and achievement pushes, each under two names.
+ *
+ * The same two-vocabulary arrangement as `FRIEND_EVENTS`, `ROOM_EVENTS` and
+ * `NOTIFICATION_EVENTS` above, and addressed the same way: to a *user*
+ * channel, so a level-up reaches every device that person is signed in on.
+ *
+ * ## Why these exist when a notification is already written
+ *
+ * Timing. A level-up has an animation, and it has to play on the result screen
+ * the player is looking at *now* — a notification is a durable record that
+ * survives being offline, which is a different job and a slower one. So the
+ * level-up is announced twice, deliberately: this event drives the animation,
+ * the notification row is what a backgrounded player finds later.
+ *
+ * Achievement unlocks travel with the match result rather than as their own
+ * event, because the result screen is where they are shown and it already
+ * carries a per-player progression report.
+ */
+export const PROGRESSION_EVENTS = {
+  /** This player crossed a level boundary. Carries the new level and title. */
+  levelUp: {
+    canonical: 's:progression:levelUp',
+    alias: 'progression:level_up',
+  },
+} as const satisfies Record<string, { canonical: string; alias: string }>;
+
+export type ProgressionEventName = keyof typeof PROGRESSION_EVENTS;
+
+// --- chat extras ------------------------------------------------------------
+
+/**
+ * Typing, reactions and deletion.
+ *
+ * ## Why typing is fire-and-forget and carries no timer
+ *
+ * A typing indicator is the one message in this protocol that is worthless a
+ * second after it is sent, so it is not acked, not persisted, and not
+ * reconciled. The client sets a local timeout and stops showing somebody as
+ * typing when nothing arrives — which means a dropped packet costs a stale
+ * dot for a second rather than a player who appears to be typing forever.
+ *
+ * ## Why a reaction is not a chat message
+ *
+ * It attaches to one, and a room of eight reacting to the same line would
+ * otherwise be eight lines pushing the conversation off screen. Reactions are
+ * counted per message and broadcast as a tally, so the transcript stays the
+ * transcript.
+ */
+
+/** Tells the room this player is typing. No ack. */
+export const CLIENT_CHAT_TYPING = 'c:chat:typing';
+/** Adds or removes one emoji reaction on one message. */
+export const CLIENT_CHAT_REACT = 'c:chat:react';
+/** Deletes one of the caller's own messages. */
+export const CLIENT_CHAT_DELETE = 'c:chat:delete';
+/** Reports one message to the operators. */
+export const CLIENT_CHAT_REPORT = 'c:chat:report';
+
+/** Somebody in the room started or stopped typing. */
+export const SERVER_CHAT_TYPING = 's:chat:typing';
+/** A message's reaction tally changed. */
+export const SERVER_CHAT_REACTION = 's:chat:reaction';
+/** A message was withdrawn; remove it from the transcript. */
+export const SERVER_CHAT_DELETED = 's:chat:deleted';
+
+// --- spectating and host controls -------------------------------------------
+
+/**
+ * Watching a room, and the host's remaining switches.
+ *
+ * ## Why spectating is its own verb rather than a flag on join
+ *
+ * A seat and a gallery place are different things with different rules — one
+ * counts towards the minimum, takes turns and scores; the other does none of
+ * those. Overloading `c:room:join` with a "spectate" flag would mean one
+ * handler serving two sets of rules, and the failure mode is a watcher who
+ * ends up in the turn order.
+ */
+
+/** Joins a room's gallery rather than its table. */
+export const CLIENT_ROOM_SPECTATE = 'c:room:spectate';
+/** Leaves the gallery. Distinct from leaving a seat. */
+export const CLIENT_ROOM_UNSPECTATE = 'c:room:unspectate';
+/** Locks or unlocks the room against new arrivals. Host only. */
+export const CLIENT_ROOM_LOCK = 'c:room:lock';
+/** Ends the room for everybody. Host only. */
+export const CLIENT_ROOM_END = 'c:room:end';
+
+/** The gallery changed. Sent to the room. */
+export const SERVER_ROOM_SPECTATORS = 's:room:spectators';
+/** Every spectator was removed, with a reason. */
+export const SERVER_ROOM_SPECTATORS_CLEARED = 's:room:spectatorsCleared';
+/** The room was locked or unlocked. */
+export const SERVER_ROOM_LOCKED = 's:room:locked';

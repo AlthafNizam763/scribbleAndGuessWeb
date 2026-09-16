@@ -1,4 +1,5 @@
 import { MIN_PLAYERS_TO_START, TIMING } from '@/constants/game.constants';
+import { FAST_GUESS_TIME_FRACTION } from '@/constants/progression.constants';
 import { CONNECTION, GAME_PHASE } from '@/constants/room.constants';
 import {
   SERVER_DRAW_CLEAR,
@@ -17,6 +18,10 @@ import { userRepository } from '@/repositories/user.repository';
 import { chatService } from '@/services/chat.service';
 import { hintSchedule, letterCount, maskWord, nextHintIndices } from '@/services/hint.service';
 import { notifyRoomEvent } from '@/services/room.notify';
+import { anomalyService } from '@/services/anomaly.service';
+import { gameModeService } from '@/services/gameMode.service';
+import { progressionService } from '@/services/progression.service';
+import { tournamentService } from '@/services/tournament.service';
 import { roomService } from '@/services/room.service';
 import { scoringService } from '@/services/scoring.service';
 import { TIMER, timerService } from '@/services/timer.service';
@@ -25,10 +30,12 @@ import { wordService } from '@/services/word.service';
 import type {
   GameResultDto,
   GameStateDto,
+  MatchAwardsDto,
   PlayerScoreDto,
   RoundResultDto,
   WordItemDto,
 } from '@/types/game.types';
+import { emptyMatchStats } from '@/types/socket.types';
 import type { RuntimePlayer, RuntimeRoom, RuntimeRound } from '@/types/socket.types';
 import { errors } from '@/utils/errors';
 import { logger } from '@/utils/logger';
@@ -103,6 +110,7 @@ export class GameService {
         correctGuesserIds: [],
         roundScores: {},
         wordChoices: [],
+        drawerSeesBoard: true,
       };
     }
 
@@ -139,6 +147,10 @@ export class GameService {
         isDrawer && room.phase === GAME_PHASE.wordSelection
           ? round.wordChoices.map(toWordItem)
           : [],
+
+      // Only the drawer is ever blinded; a guesser who could not see the board
+      // would have nothing to guess from.
+      drawerSeesBoard: !isDrawer || gameModeService.drawerSeesBoard(room),
     };
   }
 
@@ -247,7 +259,16 @@ export class GameService {
     const abandonedBoard = room.board.strokes;
 
     room.round = null;
-    room.board = { strokes: [], redoStack: [] };
+    // Relay keeps the picture: the next drawer adds to what is already there,
+    // which is the whole mode. Every other mode starts clean.
+    if (!gameModeService.keepsBoard(room)) {
+      room.board = { strokes: [], redoStack: [] };
+    } else {
+      // The redo stack is still dropped — it belongs to the previous drawer,
+      // and letting a new one redo somebody else's undone stroke would put
+      // marks on the board nobody drew this turn.
+      room.board.redoStack = [];
+    }
     room.phase = GAME_PHASE.paused;
 
     for (const player of room.players.values()) {
@@ -316,6 +337,8 @@ export class GameService {
     // legal "this pass is done" value, so anything past it is clamped back.
     if (room.turnIndex > room.turnOrder.length) room.turnIndex = room.turnOrder.length;
 
+    gameModeService.assignTeams(room);
+
     room.phase = GAME_PHASE.starting;
     await roomService.persist(room);
     await this.broadcastState(room);
@@ -356,6 +379,18 @@ export class GameService {
       throw errors.invalidAction(`You need at least ${MIN_PLAYERS_TO_START} players to start.`);
     }
 
+    // The mode decides whether this many players can play at all. Checked here
+    // rather than at join time: a room fills and empties before anybody presses
+    // start, and refusing to *open* a Duo room because it briefly held five
+    // would be wrong.
+    gameModeService.assertCanStart(room, connected.length);
+
+    // Mode overrides are folded in once, here, and the turn loop reads the
+    // result. Resolving per turn would let a host editing the room change the
+    // rules under a live turn — which is also what "settings lock when the
+    // game starts" means in practice.
+    room.settings = gameModeService.resolveSettings(room.settings);
+
     this.resetScores(room);
 
     room.turnOrder = shuffled(connected.map((player) => player.userId));
@@ -364,6 +399,8 @@ export class GameService {
     room.currentRound = 1;
     room.totalRounds = room.settings.rounds;
     room.usedWords = new Set();
+    gameModeService.assignTeams(room);
+
     room.phase = GAME_PHASE.starting;
 
     const game = await gameRepository.create({
@@ -390,6 +427,65 @@ export class GameService {
     timerService.schedule(room, TIMER.startCountdown, TIMING.startCountdownSeconds * 1000, () => {
       void this.beginTurn(room);
     });
+  }
+
+  /**
+   * Who did what this match, for the result card.
+   *
+   * Read from the per-match tallies the progression feature already
+   * keeps on each seat, so this is a walk of the players rather than a
+   * query. Ties are broken deliberately rather than left to iteration
+   * order: a card that named a different best drawer each time it was
+   * opened would be worse than one that named nobody.
+   */
+  private matchAwards(
+    room: RuntimeRoom,
+    standings: readonly PlayerScoreDto[],
+  ): MatchAwardsDto {
+    let bestDrawer: RuntimePlayer | null = null;
+    let bestGuesser: RuntimePlayer | null = null;
+    let fastestGuesser: RuntimePlayer | null = null;
+
+    for (const player of room.players.values()) {
+      const stats = player.matchStats;
+
+      // Perfect turns first, then turns drawn: a drawer everybody read
+      // twice beats one who drew five times and was read once.
+      if (
+        stats.drawingTurns > 0 &&
+        (bestDrawer === null ||
+          stats.perfectDrawings > bestDrawer.matchStats.perfectDrawings ||
+          (stats.perfectDrawings === bestDrawer.matchStats.perfectDrawings &&
+            stats.drawingTurns > bestDrawer.matchStats.drawingTurns))
+      ) {
+        bestDrawer = player;
+      }
+
+      if (
+        stats.correctGuesses > 0 &&
+        (bestGuesser === null ||
+          stats.correctGuesses > bestGuesser.matchStats.correctGuesses)
+      ) {
+        bestGuesser = player;
+      }
+
+      if (
+        stats.firstGuesses > 0 &&
+        (fastestGuesser === null ||
+          stats.firstGuesses > fastestGuesser.matchStats.firstGuesses)
+      ) {
+        fastestGuesser = player;
+      }
+    }
+
+    return {
+      // The standings are already ranked, so the top scorer is the first
+      // row — no second sort, and no way for the two to disagree.
+      topScorerId: standings[0]?.playerId ?? null,
+      bestDrawerId: bestDrawer?.userId ?? null,
+      bestGuesserId: bestGuesser?.userId ?? null,
+      fastestGuesserId: fastestGuesser?.userId ?? null,
+    };
   }
 
   /** Zeroes every score and per-turn flag, for a new match. */
@@ -452,7 +548,16 @@ export class GameService {
       player.roundScore = 0;
     }
 
-    room.board = { strokes: [], redoStack: [] };
+    // Relay keeps the picture: the next drawer adds to what is already there,
+    // which is the whole mode. Every other mode starts clean.
+    if (!gameModeService.keepsBoard(room)) {
+      room.board = { strokes: [], redoStack: [] };
+    } else {
+      // The redo stack is still dropped — it belongs to the previous drawer,
+      // and letting a new one redo somebody else's undone stroke would put
+      // marks on the board nobody drew this turn.
+      room.board.redoStack = [];
+    }
     room.turnNumber += 1;
     room.phase = GAME_PHASE.wordSelection;
 
@@ -733,11 +838,25 @@ export class GameService {
       msTotal,
       guessOrder: order,
       difficulty: round.wordDifficulty,
+      modeMultiplier: gameModeService.scoreMultiplier(room),
     });
 
     player.score += points;
     player.roundScore = points;
     round.scoreDeltas.set(userId, points);
+
+    // The progression tally. In memory rather than written now: this is the
+    // hottest path in the game, and nothing reads these until the match ends.
+    // See `RuntimeMatchStats` for why that also makes abandoned games pay out
+    // nothing.
+    player.matchStats.correctGuesses += 1;
+    if (order === 1) player.matchStats.firstGuesses += 1;
+    // "Fast" is a fraction of the turn, not a number of seconds — the drawing
+    // time is a room setting, so a fixed cut-off would make this trivial in
+    // short rooms and unreachable in long ones.
+    if (msTotal > 0 && msRemaining / msTotal >= FAST_GUESS_TIME_FRACTION) {
+      player.matchStats.fastGuesses += 1;
+    }
 
     await roundRepository.recordCorrectGuess(round.roundId, {
       userId,
@@ -814,11 +933,24 @@ export class GameService {
         correctGuessers: round.correctOrder.length,
         totalGuessers: guessers.length,
         difficulty: round.wordDifficulty,
+        modeMultiplier: gameModeService.scoreMultiplier(room),
       });
       if (drawerPoints > 0) {
         drawer.score += drawerPoints;
         drawer.roundScore = drawerPoints;
         round.scoreDeltas.set(drawer.userId, drawerPoints);
+      }
+
+      // The drawer's half of the progression tally. Counted here rather than
+      // at `beginTurn` because the turn has to have been *finished* to count —
+      // a drawer who left mid-turn drew nothing anybody could score.
+      drawer.matchStats.drawingTurns += 1;
+
+      // "Perfect" means everybody who could guess did. A turn with nobody to
+      // guess is not perfect, it is empty, which is why the count is required
+      // to be positive rather than merely equal.
+      if (guessers.length > 0 && round.correctOrder.length >= guessers.length) {
+        drawer.matchStats.perfectDrawings += 1;
       }
     }
 
@@ -831,6 +963,11 @@ export class GameService {
 
     const result: RoundResultDto = {
       round: round.roundNumber,
+      // What a client needs to ask for this turn's replay, which is available
+      // from exactly this moment: the turn has ended, so `replayService` will
+      // serve the drawing and the word.
+      gameId: room.gameId,
+      turnNumber: round.turnNumber,
       word: round.word ?? '',
       drawerId: round.drawerId,
       scoreDeltas,
@@ -930,10 +1067,28 @@ export class GameService {
 
     const winner = standings.find((entry) => entry.rank === 1) ?? null;
 
+    // The match awards, for the shareable result card.
+    //
+    // Computed from the per-match tallies the progression feature already
+    // keeps, so this costs a walk of the seats rather than a query. "Best
+    // drawer" is whoever drew the most perfect turns, breaking ties on turns
+    // drawn — a drawer everybody read twice beats one who drew five times and
+    // was read once.
+    const awards = this.matchAwards(room, standings);
+
+    // Quietly checks the standings for anything implausible. Never throws,
+    // never blocks, and never punishes: a flag lands in the same review queue
+    // a player's report lands in, and a person decides.
+    void anomalyService.inspectMatch({ room, standings }).catch(() => {
+      // Already logged inside; a failed flag must not disturb the match.
+    });
+
     const result: GameResultDto = {
       roomCode: room.code,
       standings,
       totalRounds: room.totalRounds,
+      gameMode: room.settings.gameMode,
+      awards,
     };
 
     if (room.gameId) {
@@ -943,23 +1098,86 @@ export class GameService {
       });
     }
 
-    // Lifetime stats. A tie means more than one winner, which is the honest
-    // reading of a draw — nobody's record should say they lost.
-    await Promise.all(
-      standings.map((entry) =>
-        userRepository.recordGameResult(entry.playerId, {
-          scored: entry.score,
+    // Lifetime stats and the global leaderboard, but only for modes whose
+    // scoring is comparable with Classic's. Team scores belong to a side and
+    // Duo splits between two a pot four would share, so folding either into
+    // `totalScore` would make the world board a ranking of which modes people
+    // happened to play. Those modes still pay XP — see `XP_AWARDS`, which
+    // measures time played rather than skill.
+    const ranked = gameModeService.isRanked(room);
+
+    if (ranked) {
+      // A tie means more than one winner, which is the honest reading of a
+      // draw — nobody's record should say they lost.
+      await Promise.all(
+        standings.map((entry) =>
+          userRepository.recordGameResult(entry.playerId, {
+            scored: entry.score,
+            won: entry.rank === 1,
+            bestRoundScore: entry.score,
+          }),
+        ),
+      ).catch((error: unknown) => {
+        logger.exception('recording game results failed', error, { roomId: room.roomId });
+      });
+
+      // Tournaments the player is registered in and that are running right
+      // now. Ranked matches only — which is why this sits inside the same
+      // branch — and the same score the match already produced: there is no
+      // separate tournament scoring, and no endpoint through which a total
+      // could be sent.
+      await Promise.all(
+        standings.map((entry) =>
+          tournamentService
+            .recordMatch({
+              userId: entry.playerId,
+              score: entry.score,
+              won: entry.rank === 1,
+            })
+            .catch((error: unknown) => {
+              // A tournament that failed to record costs a player some event
+              // points, never the match they just finished.
+              logger.exception('recording tournament score failed', error, {
+                roomId: room.roomId,
+                userId: entry.playerId,
+              });
+            }),
+        ),
+      );
+    }
+
+    // XP, streaks and achievements. Must run *after* the lifetime stats above,
+    // because the achievement evaluator reads `gamesPlayed` and `gamesWon`
+    // from the row those writes just updated.
+    //
+    // Awaited rather than fired and forgotten, so the result broadcast below
+    // can carry what was earned and the client can animate it without a second
+    // request. It cannot fail the match: every path inside is wrapped, and the
+    // catch here is the last resort.
+    const progression = await progressionService
+      .recordMatch({
+        room,
+        standings: standings.map((entry) => ({
+          playerId: entry.playerId,
+          score: entry.score,
           won: entry.rank === 1,
-          bestRoundScore: entry.score,
-        }),
-      ),
-    ).catch((error: unknown) => {
-      logger.exception('recording game results failed', error, { roomId: room.roomId });
-    });
+        })),
+        gameId: room.gameId,
+      })
+      .catch((error: unknown) => {
+        logger.exception('recording progression failed', error, { roomId: room.roomId });
+        return [];
+      });
 
     await roomService.persist(room);
 
-    emitToRoom(room.roomId, SERVER_GAME_END, { result });
+    // Per viewer, because the report is personal: a player is told their own
+    // XP and unlocks, never anybody else's. One broadcast cannot express that,
+    // which is the same reason `emitPerViewer` exists for the game state.
+    await emitPerViewer(room.roomId, SERVER_GAME_END, (viewerId) => ({
+      result,
+      progression: progression.find((entry) => entry.playerId === viewerId) ?? null,
+    }));
     await this.broadcastState(room);
 
     if (winner) await chatService.system(room, `${winner.name} wins!`);
@@ -985,7 +1203,16 @@ export class GameService {
     room.phase = GAME_PHASE.lobby;
     room.round = null;
     room.gameId = null;
-    room.board = { strokes: [], redoStack: [] };
+    // Relay keeps the picture: the next drawer adds to what is already there,
+    // which is the whole mode. Every other mode starts clean.
+    if (!gameModeService.keepsBoard(room)) {
+      room.board = { strokes: [], redoStack: [] };
+    } else {
+      // The redo stack is still dropped — it belongs to the previous drawer,
+      // and letting a new one redo somebody else's undone stroke would put
+      // marks on the board nobody drew this turn.
+      room.board.redoStack = [];
+    }
     room.turnOrder = [];
     room.turnIndex = 0;
     room.turnNumber = 0;
@@ -997,6 +1224,10 @@ export class GameService {
       player.hasGuessed = false;
       player.guessOrder = null;
       player.roundScore = 0;
+      // Cleared with the rest of the per-match state. Without this a "play
+      // again" would fold the previous match's guesses into the next one's
+      // payout, paying for the same work twice.
+      player.matchStats = emptyMatchStats();
     }
 
     await roomService.persist(room);

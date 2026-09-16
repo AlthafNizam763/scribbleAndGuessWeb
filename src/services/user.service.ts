@@ -81,12 +81,33 @@ export class UserService {
     };
   }
 
-  /** Updates the two fields a player owns. */
+  /**
+   * Updates the fields a player owns.
+   *
+   * Still no score, no counter, no level: the parameter list is the
+   * permission, and the cosmetic fields added here are keys from closed
+   * sets rather than colours or assets, so the worst a crafted body can do
+   * is choose a frame.
+   */
   async updateProfile(
     userId: string,
-    patch: { username?: string; avatarId?: number; avatarColorIndex?: number },
+    patch: {
+      username?: string;
+      avatarId?: number;
+      avatarColorIndex?: number;
+      bio?: string;
+      profileFrame?: string;
+      profileTheme?: string;
+    },
   ): Promise<PublicUser> {
-    const update: { username?: string; avatarId?: number; avatarColorIndex?: number } = {};
+    const update: {
+      username?: string;
+      avatarId?: number;
+      avatarColorIndex?: number;
+      bio?: string;
+      profileFrame?: string;
+      profileTheme?: string;
+    } = {};
 
     if (patch.username !== undefined) update.username = sanitizeUsername(patch.username);
 
@@ -96,6 +117,12 @@ export class UserService {
     if (patch.avatarColorIndex !== undefined) {
       update.avatarColorIndex = clamp(patch.avatarColorIndex, INPUT_LIMITS.avatarColorCount);
     }
+
+    // An empty string is a deliberate clear, not an omission, so it is
+    // distinguished from `undefined` rather than trimmed away.
+    if (patch.bio !== undefined) update.bio = patch.bio.trim();
+    if (patch.profileFrame !== undefined) update.profileFrame = patch.profileFrame;
+    if (patch.profileTheme !== undefined) update.profileTheme = patch.profileTheme;
 
     if (Object.keys(update).length === 0) throw errors.validation('Nothing to update.');
 
@@ -155,6 +182,13 @@ export class UserService {
       ...toUserSummary(row),
       stats: toUserStats(row),
       locality: toLocality(row),
+      // Cosmetics and the bio come straight off the row. The bio was masked on
+      // the way in, so nothing is filtered on the way out — a profile read
+      // must not be able to differ from what the owner saved.
+      bio: row.bio ?? '',
+      profileFrame: row.profileFrame ?? 'none',
+      profileTheme: row.profileTheme ?? 'paper',
+      favoriteCategory: row.favoriteCategory ?? null,
       rank,
       lastSeenAtMs: new Date(row.lastSeenAt ?? Date.now()).getTime(),
       createdAtMs: new Date(row.createdAt ?? Date.now()).getTime(),

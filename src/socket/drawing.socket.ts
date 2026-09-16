@@ -14,6 +14,7 @@ import {
   SERVER_DRAW_UNDO,
 } from '@/constants/socket.constants';
 import { drawingService } from '@/services/drawing.service';
+import { gameModeService } from '@/services/gameMode.service';
 import { on } from '@/socket/handler';
 import type { GameSocket } from '@/types/socket.types';
 
@@ -53,6 +54,15 @@ export function registerDrawingHandlers(socket: GameSocket): void {
 
       const body = (payload ?? {}) as { stroke?: unknown };
       const stroke = drawingService.sanitizeStroke(body.stroke ?? payload, userId);
+
+      // One Colour, enforced on the stroke rather than in the toolbar. The
+      // lock is the first colour the drawer actually used this turn — read
+      // from the board, so it survives a reconnect — and a stroke in any other
+      // colour is rewritten rather than refused: a drawer whose line silently
+      // failed would think the canvas was broken, while one whose line comes
+      // out the wrong colour can see the rule at work.
+      const locked = gameModeService.lockedColor(room);
+      if (locked !== null && stroke.t !== 'eraser') stroke.c = locked;
 
       if (!drawingService.begin(room, stroke)) return;
 

@@ -19,6 +19,7 @@ import {
   markNotificationRead as markNotificationReadRequest,
   type NotificationDto,
 } from '@/web/notifications';
+import type { MatchProgressionDto } from '@/web/progression';
 import {
   acceptInvitation as acceptInvitationRequest,
   fetchInvitations,
@@ -113,6 +114,16 @@ interface GameContextValue {
   invitations: RoomInvitationDto[];
   /** The newest unanswered invitation, for the toast. Null once dismissed. */
   incomingInvitation: RoomInvitationDto | null;
+
+  /**
+   * What the last finished match paid the local player.
+   *
+   * Built per recipient by the server, so it is never anybody else's. Null for
+   * a match that paid nothing — an abandoned game, or one the server declined
+   * to rank — and the result view then omits the section rather than showing
+   * "+0 XP".
+   */
+  matchProgression: MatchProgressionDto | null;
 
   /**
    * The caller's notifications, newest first.
@@ -219,6 +230,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
   const [invitations, setInvitations] = useState<RoomInvitationDto[]>([]);
   const [incomingInvitation, setIncomingInvitation] =
     useState<RoomInvitationDto | null>(null);
+  const [matchProgression, setMatchProgression] =
+    useState<MatchProgressionDto | null>(null);
   const [notifications, setNotifications] = useState<NotificationDto[]>([]);
   const [unreadNotifications, setUnreadNotifications] = useState(0);
 
@@ -373,9 +386,30 @@ export function GameProvider({ children }: { children: ReactNode }) {
       setWordChoices([]);
     });
 
-    socket.on('s:game:end', (payload: { result: GameResultDto }) => {
-      if (payload?.result) setGameResult(payload.result);
-      setWordChoices([]);
+    socket.on(
+      's:game:end',
+      (payload: { result: GameResultDto; progression?: MatchProgressionDto | null }) => {
+        if (payload?.result) setGameResult(payload.result);
+        setWordChoices([]);
+
+        // The payout rides on the same event, built per recipient — so this is
+        // always the local player's own report and never anybody else's. Null
+        // for a match the server declined to rank, which is what an abandoned
+        // game pays.
+        setMatchProgression(payload?.progression ?? null);
+      },
+    );
+
+    /**
+     * A level-up, for the animation.
+     *
+     * Exists alongside the durable notification rather than instead of it: the
+     * banner has to appear on the result screen the player is looking at now,
+     * while the notification is what a backgrounded player finds later.
+     */
+    socket.on('s:progression:levelUp', (payload: { level?: number; title?: string }) => {
+      if (typeof payload?.level !== 'number') return;
+      setNotice(`Level ${payload.level} — ${payload.title ?? ''}`.trim());
     });
 
     socket.on('s:chat:message', (payload: { message: ChatMessageDto }) => {
@@ -937,6 +971,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       notifications,
       unreadNotifications,
       incomingInvitation,
+      matchProgression,
       signIn,
       createRoom,
       joinRoom,
@@ -981,6 +1016,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       notifications,
       unreadNotifications,
       incomingInvitation,
+      matchProgression,
       signIn,
       createRoom,
       joinRoom,

@@ -29,6 +29,11 @@ export interface UserStatsDto {
   /** Rounded to one decimal place, 0 when nothing has been played. */
   winRate: number;
   bestRoundScore: number;
+  /** Lifetime XP. Server-computed; a client can only read it. */
+  xp: number;
+  /** The level that XP buys, and its tier name. */
+  level: number;
+  levelTitle: string;
 }
 
 /** A town, as the locality board shows it. Never an address. */
@@ -104,6 +109,13 @@ export interface BlockDto extends UserSummaryDto {
 
 /** A full profile, plus how the caller stands relative to it. */
 export interface PublicProfileDto extends UserSummaryDto {
+  /** A short self-description, masked by the profanity filter on save. */
+  bio: string;
+  /** Cosmetic keys. An unknown key renders as the default. */
+  profileFrame: string;
+  profileTheme: string;
+  /** The category this player plays most, or null before they have one. */
+  favoriteCategory: string | null;
   stats: UserStatsDto;
   locality: LocalityDto | null;
   /** The world rank, or null when this user has never finished a game. */

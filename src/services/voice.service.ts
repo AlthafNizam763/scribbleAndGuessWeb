@@ -121,6 +121,14 @@ export class VoiceService {
       throw errors.invalidAction('You are not connected to this room.');
     }
 
+    // The host's switch. Checked here rather than only in `join` so that a
+    // room whose voice is turned off mid-turn also refuses the offers,
+    // answers and candidates of connections that were already open — the
+    // reconciler hangs those up, and this is what stops them being rebuilt.
+    if (!room.settings.voiceEnabled) {
+      throw errors.invalidAction('Voice chat is off in this room.');
+    }
+
     // The rule. Checked before the phase test so a drawer poking at the
     // protocol always gets the specific refusal rather than a vaguer one.
     if (this.isDrawer(room, userId)) throw errors.drawerVoiceDisabled();
@@ -263,7 +271,10 @@ export class VoiceService {
       const player = room.players.get(member.userId);
 
       let reason: string | null = null;
-      if (!open) reason = 'voice_closed';
+      // The host's switch first: a room with voice turned off hangs everybody
+      // up regardless of phase or who is drawing.
+      if (!room.settings.voiceEnabled) reason = 'voice_disabled';
+      else if (!open) reason = 'voice_closed';
       else if (member.userId === drawer) reason = 'drawer';
       else if (!player) reason = 'left_room';
       else if (player.connection === CONNECTION.disconnected) reason = 'disconnected';
@@ -288,7 +299,11 @@ export class VoiceService {
    */
   stateFor(room: RuntimeRoom, userId: string): VoiceStateDto {
     const isDrawer = this.isDrawer(room, userId);
-    const enabled = this.isVoicePhase(room) && !isDrawer && room.players.has(userId);
+    const enabled =
+      room.settings.voiceEnabled &&
+      this.isVoicePhase(room) &&
+      !isDrawer &&
+      room.players.has(userId);
 
     return {
       enabled,

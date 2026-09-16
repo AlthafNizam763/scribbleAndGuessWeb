@@ -73,6 +73,14 @@ export class ScoringService {
     msRemaining: number;
     msTotal: number;
     guessOrder: number;
+    /**
+     * The game mode's multiplier, applied last.
+     *
+     * Compensates for how much harder a mode makes guessing rather than
+     * rewarding the choice of mode — so no mode is the obvious one to farm.
+     * Defaults to 1, so a caller that does not care need not pass it.
+     */
+    modeMultiplier?: number;
     difficulty: WordDifficultyWire;
   }): number {
     const { config } = this;
@@ -90,7 +98,10 @@ export class ScoringService {
             ? config.thirdGuessBonus
             : 0;
 
-    const total = (timeComponent + orderBonus) * multiplierFor(config, input.difficulty);
+    const total =
+      (timeComponent + orderBonus) *
+      multiplierFor(config, input.difficulty) *
+      (input.modeMultiplier ?? 1);
     return Math.max(0, Math.round(total));
   }
 
@@ -106,13 +117,19 @@ export class ScoringService {
   drawerPoints(input: {
     correctGuessers: number;
     totalGuessers: number;
+    /** The game mode's multiplier. See `guesserPoints`. */
+    modeMultiplier?: number;
     difficulty: WordDifficultyWire;
   }): number {
     const { config } = this;
     if (input.totalGuessers <= 0 || input.correctGuessers <= 0) return 0;
 
     const guessed = Math.min(input.correctGuessers, input.totalGuessers);
-    const earned = config.drawerPointsPerGuess * guessed * multiplierFor(config, input.difficulty);
+    const earned =
+      config.drawerPointsPerGuess *
+      guessed *
+      multiplierFor(config, input.difficulty) *
+      (input.modeMultiplier ?? 1);
     const withBonus = guessed >= input.totalGuessers ? earned + config.drawerAllGuessedBonus : earned;
 
     return Math.min(Math.max(0, Math.round(withBonus)), Math.max(0, config.drawerMaxPoints));

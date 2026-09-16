@@ -38,6 +38,9 @@ export interface PlayerDto {
   guessOrder: number | null;
   isMuted: boolean;
   connection: ConnectionWire;
+
+  /** Which side this player is on. `none` outside a team mode. */
+  team: string;
 }
 
 /** `lib/models/room_settings.dart`. */
@@ -53,6 +56,18 @@ export interface RoomSettingsDto {
   categories: WordCategoryWire[];
   customWords: string[];
   allowVoteKick: boolean;
+  /** Whether guessers may talk to each other. The drawer never can. */
+  voiceEnabled: boolean;
+  /** Whether the text channel is open. Guessing is never affected. */
+  chatEnabled: boolean;
+  /** Which rule set the match runs under. */
+  gameMode: string;
+  /** Whether people may watch once the seats are full. */
+  allowSpectators: boolean;
+  /** Whether only the host's friends may join by code. */
+  friendsOnly: boolean;
+  /** Narrows the word pool, or null to let the mode decide. */
+  wordDifficulty: string | null;
   isPrivate: boolean;
 }
 
@@ -66,6 +81,18 @@ export interface RoomDto {
   status: RoomStatusWire;
   createdAtMs: number;
   bannedIds: string[];
+
+  /**
+   * Who is watching without a seat.
+   *
+   * A separate list from `players` on the wire because it is a separate list
+   * in the engine — a spectator is not a player with a flag, they are absent
+   * from the turn order entirely.
+   */
+  spectators: SpectatorDto[];
+
+  /** Whether the host has locked the room against new arrivals. */
+  locked: boolean;
 }
 
 /** `lib/models/player_profile.dart`, sent by the client on handshake. */
@@ -163,4 +190,18 @@ export interface RoomMembersDto {
   maxPlayers: number;
   status: RoomStatusWire;
   members: PlayerDto[];
+}
+
+/**
+ * Somebody watching a room.
+ *
+ * Deliberately smaller than `PlayerDto`: no score, no ready flag, no team, no
+ * guess state. There is nothing here a scoreboard could render, which is the
+ * point — a spectator has none of those things.
+ */
+export interface SpectatorDto {
+  userId: string;
+  username: string;
+  avatarId: number;
+  avatarColorIndex: number;
 }

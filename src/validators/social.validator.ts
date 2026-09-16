@@ -135,3 +135,15 @@ function emptyToNull(value: string | null | undefined): string | null {
   const trimmed = (value ?? '').trim();
   return trimmed.length > 0 ? trimmed : null;
 }
+
+/**
+ * `PATCH /api/admin/reports/:reportId`.
+ *
+ * `pending` is deliberately not accepted: a report is resolved forwards, and
+ * reopening one would let a reviewer quietly undo somebody else's decision
+ * without leaving a trace of having done so.
+ */
+export const resolveReportSchema = z.object({
+  status: z.enum(['actioned', 'dismissed']).default('dismissed'),
+  note: z.string().trim().max(280).optional(),
+});

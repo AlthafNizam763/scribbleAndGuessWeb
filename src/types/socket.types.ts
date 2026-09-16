@@ -4,6 +4,7 @@ import type { ConnectionWire, GamePhaseWire, WordDifficultyWire } from '@/consta
 import type { AuthenticatedUser } from '@/types/auth.types';
 import type { StrokeDto } from '@/types/drawing.types';
 import type { WordItemDto } from '@/types/game.types';
+import type { TeamWire } from '@/constants/gameModes.constants';
 import type { RoomSettingsDto } from '@/types/room.types';
 
 /** What every ack-bearing client event resolves to. */
@@ -88,6 +89,53 @@ export interface RuntimePlayer {
   lastSeenAt: number;
   /** When the reconnect grace period expires, or null while connected. */
   disconnectDeadline: number | null;
+
+  /**
+   * What this player has done *this match*, for XP and achievements.
+   *
+   * ## Why it is tallied in memory and written once
+   *
+   * A correct guess is worth XP, and a busy room produces a dozen a minute.
+   * Writing each one immediately would put a database round trip on the
+   * hottest path in the game, for a number nothing reads until the match ends.
+   * So the engine counts here and the progression service folds the whole
+   * tally into the user row in one `$inc` at `endGame`.
+   *
+   * ## It is also how "no XP for abandoned games" is enforced
+   *
+   * Not by a check, but by construction: a tally that never reaches the end of
+   * a match is discarded with the room. A game that is abandoned, closed, or
+   * paused into oblivion pays nothing, because the only code that reads this
+   * runs after the final standings are computed.
+   */
+  matchStats: RuntimeMatchStats;
+
+  /** Which side this player is on. `none` outside a team mode. */
+  team: TeamWire;
+}
+
+/** One player's per-match tally. Reset whenever the room returns to a lobby. */
+export interface RuntimeMatchStats {
+  correctGuesses: number;
+  /** Correct guesses that were the first of their turn. */
+  firstGuesses: number;
+  /** Correct guesses inside the opening fraction of a turn. */
+  fastGuesses: number;
+  /** Turns drawn and finished. */
+  drawingTurns: number;
+  /** Turns drawn where every eligible guesser got it. */
+  perfectDrawings: number;
+}
+
+/** A fresh tally. One place, so a new counter cannot be forgotten at a seat. */
+export function emptyMatchStats(): RuntimeMatchStats {
+  return {
+    correctGuesses: 0,
+    firstGuesses: 0,
+    fastGuesses: 0,
+    drawingTurns: 0,
+    perfectDrawings: 0,
+  };
 }
 
 /** The live board. Rebuilt from scratch every turn. */
@@ -169,6 +217,41 @@ export interface RuntimeVoice {
 }
 
 /** A live room: the single source of truth while the process is up. */
+/**
+ * One recently-broadcast message, kept so it can be reacted to or withdrawn.
+ *
+ * ## Why this is in memory and bounded
+ *
+ * A reaction has to resolve a message id to its author — to check that a
+ * deletion is the author's own — and doing that in Mongo would be a query per
+ * tap on an emoji. It is also pointless past the recent past: nobody reacts to
+ * a line that scrolled away ten minutes ago, and the transcript in Mongo is
+ * the durable record either way.
+ *
+ * So the index holds the last `chatIndexLimit` messages of a live room and
+ * forgets the rest. A reaction to something older is refused as "no such
+ * message", which is indistinguishable from a message that never existed and
+ * is the honest answer: this process no longer knows.
+ */
+export interface RuntimeChatMessage {
+  senderId: string;
+  /** Emoji to the set of users who reacted with it. */
+  reactions: Map<string, Set<string>>;
+}
+
+/** A room's recent chat, for reactions and deletion. */
+export interface RuntimeChat {
+  /** Insertion-ordered, so the oldest entry is the first to evict. */
+  recent: Map<string, RuntimeChatMessage>;
+  /** Who is typing, to the epoch millisecond their last keystroke arrived. */
+  typing: Map<string, number>;
+}
+
+/** A fresh chat index. */
+export function emptyChat(): RuntimeChat {
+  return { recent: new Map(), typing: new Map() };
+}
+
 export interface RuntimeRoom {
   roomId: string;
   code: string;
@@ -176,6 +259,26 @@ export interface RuntimeRoom {
   createdAtMs: number;
 
   settings: RoomSettingsDto;
+
+  /**
+   * Who is watching without a seat.
+   *
+   * A separate map rather than a flag on `players`, and that is the whole
+   * design: every rule in the engine iterates `players` — the turn order, the
+   * minimum-player check, scoring, the all-guessed test, voice membership. A
+   * spectator *flag* would mean auditing every one of those to exclude them,
+   * and the one that was missed would be a watcher who could win the game.
+   *
+   * Being absent from `players` makes "cannot draw, cannot guess, cannot
+   * score" true by construction rather than by a check.
+   */
+  spectators: Map<string, RuntimeSpectator>;
+
+  /** Whether the host has locked the room against new arrivals. */
+  locked: boolean;
+
+  /** Recent messages and who is typing. Never persisted. */
+  chat: RuntimeChat;
   /** Seats in turn order. A Map keeps insertion order and O(1) lookup. */
   players: Map<string, RuntimePlayer>;
   bannedIds: Set<string>;
@@ -203,4 +306,22 @@ export interface RuntimeRoom {
   /** When the room became empty, or null while somebody is seated. */
   emptySince: number | null;
   closed: boolean;
+}
+
+/**
+ * Somebody watching a room without holding a seat.
+ *
+ * Deliberately a far smaller record than a player: a spectator has no score,
+ * no ready flag, no guess state, no team and no turn. There is nothing here
+ * for the game to read, which is exactly the point — a spectator cannot affect
+ * a match because there is no field through which they could.
+ */
+export interface RuntimeSpectator {
+  userId: string;
+  username: string;
+  avatarId: number;
+  avatarColorIndex: number;
+  /** Every live socket this watcher holds. */
+  socketIds: Set<string>;
+  joinedAt: number;
 }

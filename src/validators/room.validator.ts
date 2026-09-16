@@ -1,7 +1,13 @@
 import { z } from 'zod';
 
 import { INPUT_LIMITS, ROOM_CODE, ROOM_LIMITS } from '@/constants/game.constants';
-import { LANGUAGES, WORD_CATEGORIES, WORD_MODES } from '@/constants/room.constants';
+import { DEFAULT_GAME_MODE } from '@/constants/gameModes.constants';
+import {
+  LANGUAGES,
+  WORD_CATEGORIES,
+  WORD_DIFFICULTIES,
+  WORD_MODES,
+} from '@/constants/room.constants';
 
 /**
  * Room validation (brief sections 12, 13 and 50).
@@ -110,6 +116,27 @@ export const roomSettingsSchema = z.object({
     ),
 
   allowVoteKick: z.boolean().catch(true).default(true),
+  voiceEnabled: z.boolean().catch(true).default(true),
+  chatEnabled: z.boolean().catch(true).default(true),
+
+  /**
+   * Which rule set the match runs under.
+   *
+   * Stored as sent and resolved at read time by `modeRules`, which falls back
+   * to Classic. One place decides what an unrecognised mode means, rather than
+   * a validator and a resolver that could disagree.
+   */
+  gameMode: z.string().trim().max(32).catch(DEFAULT_GAME_MODE).default(DEFAULT_GAME_MODE),
+
+  allowSpectators: z.boolean().catch(true).default(true),
+  friendsOnly: z.boolean().catch(false).default(false),
+
+  /** Null means the mode, or the room's categories, decide the pool. */
+  wordDifficulty: z
+    .enum(WORD_DIFFICULTIES)
+    .nullable()
+    .catch(null)
+    .default(null),
   isPrivate: z.boolean().catch(false).default(false),
 });
 
@@ -132,6 +159,12 @@ export const createRoomSchema = z.object({
   categories: z.unknown().optional(),
   customWords: z.unknown().optional(),
   allowVoteKick: z.unknown().optional(),
+  voiceEnabled: z.unknown().optional(),
+  chatEnabled: z.unknown().optional(),
+  gameMode: z.unknown().optional(),
+  allowSpectators: z.unknown().optional(),
+  friendsOnly: z.unknown().optional(),
+  wordDifficulty: z.unknown().optional(),
   isPrivate: z.unknown().optional(),
 });
 
@@ -193,6 +226,12 @@ export function normalizeCreateRoomBody(body: z.infer<typeof createRoomSchema>):
     categories: body.categories,
     customWords: body.customWords,
     allowVoteKick: body.allowVoteKick,
+    voiceEnabled: body.voiceEnabled,
+    chatEnabled: body.chatEnabled,
+    gameMode: body.gameMode,
+    allowSpectators: body.allowSpectators,
+    friendsOnly: body.friendsOnly,
+    wordDifficulty: body.wordDifficulty,
     isPrivate: body.isPrivate,
   };
 

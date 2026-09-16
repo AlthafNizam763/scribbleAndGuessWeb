@@ -177,6 +177,9 @@ export default function HomePage() {
                 * the last push — never arithmetic on the previous value. See
                 * `unreadNotifications` in the provider for why.
                 */}
+              <button type="button" onClick={() => router.push('/achievements')}>
+                Achievements
+              </button>
               <button type="button" onClick={() => router.push('/notifications')}>
                 Notifications
                 {unreadNotifications > 0 ? (

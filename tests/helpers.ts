@@ -1,5 +1,7 @@
 import { GAME_PHASE } from '@/constants/room.constants';
 import { defaultSettings } from '@/services/room.service';
+import { TEAM } from '@/constants/gameModes.constants';
+import { emptyChat, emptyMatchStats } from '@/types/socket.types';
 import type { RuntimePlayer, RuntimeRoom, RuntimeRound } from '@/types/socket.types';
 
 /**
@@ -13,6 +15,12 @@ import type { RuntimePlayer, RuntimeRoom, RuntimeRound } from '@/types/socket.ty
 
 export function makePlayer(overrides: Partial<RuntimePlayer> & { userId: string }): RuntimePlayer {
   return {
+    // Spread below, so a test can hand in a partial tally and still get a
+    // complete one — the progression counters are read unconditionally by the
+    // end-of-match path, and a missing field there is a crash rather than a
+    // zero.
+    matchStats: emptyMatchStats(),
+    team: TEAM.none,
     username: `player-${overrides.userId}`,
     avatarId: 0,
     avatarColorIndex: 0,
@@ -78,6 +86,9 @@ export function makeRoom(
     board: { strokes: [], redoStack: [] },
     voteKick: null,
     voice: { members: new Map() },
+    chat: emptyChat(),
+    spectators: new Map(),
+    locked: false,
     timers: new Map(),
     emptySince: null,
     closed: false,

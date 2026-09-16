@@ -93,3 +93,94 @@ export const LOCALITY_LIMITS = {
   /** ISO 3166-1 alpha-2, so exactly two letters. */
   countryLength: 2,
 } as const;
+
+/**
+ * Bounds and vocabularies for profile customisation.
+ *
+ * ## Why cosmetics are keys and not values
+ *
+ * A stored hex colour or asset URL is an arbitrary string on a public profile —
+ * something a client chose, that every viewer then renders. A *key* can only
+ * ever name something this build ships, so the worst a malicious client can do
+ * is pick a frame it is not entitled to, which is a cosmetic bug rather than a
+ * way to put content on somebody else's screen.
+ *
+ * Unknown keys render as the default, so retiring a frame does not break the
+ * accounts already wearing it.
+ */
+export const PROFILE_LIMITS = {
+  maxBioLength: 140,
+} as const;
+
+/** The frames a profile picture may wear. */
+export const PROFILE_FRAMES = [
+  'none',
+  'ink',
+  'gold',
+  'leaf',
+  'wave',
+  'star',
+] as const;
+export type ProfileFrameWire = (typeof PROFILE_FRAMES)[number];
+
+/** The colour themes a profile may be drawn in. */
+export const PROFILE_THEMES = [
+  'paper',
+  'sky',
+  'mint',
+  'rose',
+  'dusk',
+] as const;
+export type ProfileThemeWire = (typeof PROFILE_THEMES)[number];
+
+/**
+ * What a report is waiting for.
+ *
+ * ## Why a status rather than deletion
+ *
+ * A reviewed report is evidence: the second report against an account matters
+ * far more when the first was upheld, and deleting resolved rows would throw
+ * that away. So a report is never removed — it moves through this lifecycle,
+ * and the history stays queryable.
+ */
+export const REPORT_STATUS = {
+  /** Filed, not yet looked at. */
+  pending: 'pending',
+  /** Looked at, and the report was upheld. */
+  actioned: 'actioned',
+  /** Looked at, and nothing was wrong. */
+  dismissed: 'dismissed',
+} as const;
+
+export type ReportStatusWire = (typeof REPORT_STATUS)[keyof typeof REPORT_STATUS];
+export const REPORT_STATUSES = Object.values(REPORT_STATUS) as ReportStatusWire[];
+
+/**
+ * What an account is allowed to do beyond playing.
+ *
+ * ## Why this is on the user and never in a token claim
+ *
+ * A role baked into a JWT is a role that cannot be revoked until the token
+ * expires — which for this app is thirty days. Reading it from the row on
+ * every privileged request costs one lookup the request was already making,
+ * and means removing somebody's access takes effect on their next call.
+ *
+ * There is no endpoint that sets this field. It is changed in the database,
+ * deliberately: a self-service path to moderator is a self-service path to
+ * reading everybody's reports.
+ */
+export const USER_ROLE = {
+  player: 'player',
+  /** May read and resolve reports. */
+  moderator: 'moderator',
+  /** May do anything a moderator may. Reserved for operations. */
+  admin: 'admin',
+} as const;
+
+export type UserRoleWire = (typeof USER_ROLE)[keyof typeof USER_ROLE];
+export const USER_ROLES = Object.values(USER_ROLE) as UserRoleWire[];
+
+/** Whether a role may review reports. */
+export function canModerate(role: string | null | undefined): boolean {
+  return role === USER_ROLE.moderator || role === USER_ROLE.admin;
+}

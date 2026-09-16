@@ -1,5 +1,12 @@
 import { INPUT_LIMITS } from '@/constants/game.constants';
-import { GAME_PHASE } from '@/constants/room.constants';
+import {
+  DRAW_TOOL,
+  DRAW_TOOLS,
+  FILL_TOOLS,
+  GAME_PHASE,
+  SHAPE_TOOLS,
+  type DrawToolWire,
+} from '@/constants/room.constants';
 import type { PointTuple, StrokeDto } from '@/types/drawing.types';
 import type { RuntimeRoom } from '@/types/socket.types';
 import { errors } from '@/utils/errors';
@@ -51,6 +58,10 @@ export class DrawingService {
    * Anything that is not a pair of finite numbers is dropped rather than
    * throwing: one malformed point in a batch of eighty should cost that point,
    * not the whole stroke.
+   *
+   * A third element is pressure, and it is preserved only when it is actually
+   * there — see `PointTuple`. Echoing a default back on every point would
+   * inflate the board snapshot with a number that carries no information.
    */
   sanitizePoints(raw: unknown): PointTuple[] {
     if (!Array.isArray(raw)) return [];
@@ -58,11 +69,34 @@ export class DrawingService {
     const points: PointTuple[] = [];
     for (const entry of raw.slice(0, INPUT_LIMITS.maxPointsPerBatch)) {
       if (!Array.isArray(entry) || entry.length < 2) continue;
-      const [x, y] = entry;
+      const [x, y, pressure] = entry;
       if (typeof x !== 'number' || typeof y !== 'number') continue;
-      points.push([this.clamp(x), this.clamp(y)]);
+
+      if (typeof pressure === 'number' && Number.isFinite(pressure)) {
+        points.push([this.clamp(x), this.clamp(y), this.clamp(pressure)]);
+      } else {
+        points.push([this.clamp(x), this.clamp(y)]);
+      }
     }
 
+    return points;
+  }
+
+  /**
+   * Trims a shape's points to the two that define it.
+   *
+   * A rectangle needs a start and an end; anything past that is noise from a
+   * client that streamed a drag it should have sent once. Trimming rather than
+   * refusing keeps a mildly wrong client drawing instead of silently failing,
+   * and bounds what the board can be made to hold either way.
+   */
+  private trimForTool(tool: DrawToolWire, points: PointTuple[]): PointTuple[] {
+    if (FILL_TOOLS.includes(tool)) {
+      // A fill has no geometry: it covers everything. One point is kept so the
+      // stroke is not mistaken for an empty one and skipped by a renderer.
+      return points.slice(0, 1);
+    }
+    if (SHAPE_TOOLS.includes(tool)) return points.slice(0, 2);
     return points;
   }
 
@@ -76,15 +110,24 @@ export class DrawingService {
     const id = typeof stroke.id === 'string' ? stroke.id.slice(0, 64) : '';
     if (id.length === 0) throw errors.validation('That stroke has no id.');
 
+    // An unrecognised tool becomes a pen rather than a refusal. A client from
+    // a future release naming a tool this server has not heard of should still
+    // put a mark on the board — the alternative is a drawer whose strokes
+    // silently vanish for everybody, which is far worse than a mark drawn with
+    // the wrong nib.
+    const tool: DrawToolWire = DRAW_TOOLS.includes(stroke.t as DrawToolWire)
+      ? (stroke.t as DrawToolWire)
+      : DRAW_TOOL.pen;
+
     return {
       id,
       // The author is taken from the authenticated socket, never from the
       // payload: otherwise a guesser could attribute strokes to the drawer.
       a: authorId,
-      p: this.sanitizePoints(stroke.p),
+      p: this.trimForTool(tool, this.sanitizePoints(stroke.p)),
       c: Number.isFinite(stroke.c) ? Number(stroke.c) : 0xff000000,
       w: Number.isFinite(stroke.w) ? Math.min(Math.max(Number(stroke.w), 0.5), 80) : 4,
-      t: stroke.t === 'eraser' ? 'eraser' : 'pen',
+      t: tool,
       ts: Number.isFinite(stroke.ts) ? Number(stroke.ts) : Date.now(),
     };
   }
@@ -114,6 +157,14 @@ export class DrawingService {
   append(room: RuntimeRoom, strokeId: string, points: PointTuple[]): boolean {
     const stroke = room.board.strokes.find((candidate) => candidate.id === strokeId);
     if (!stroke) return false;
+
+    // A shape is its two points and a fill is none; neither has anything to
+    // append to. Enforced here as well as in `sanitizeStroke` because the two
+    // are separate entry points: trimming only on `begin` would leave a client
+    // free to stream four hundred points into a "rectangle" afterwards, which
+    // is both a way past the shape cap and a way to make every other client
+    // render something the geometry does not describe.
+    if (SHAPE_TOOLS.includes(stroke.t) || FILL_TOOLS.includes(stroke.t)) return false;
 
     if (stroke.p.length + points.length > INPUT_LIMITS.maxPointsPerStroke) {
       // A stroke this long is a client that never sent `end`. Take what fits

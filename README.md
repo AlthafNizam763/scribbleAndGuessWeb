@@ -179,6 +179,8 @@ reconnects, and land back in the lobby.
 | `blocks` | Directional: belongs to the blocker | `{blockerId, blockedUserId}` unique · `{blockedUserId}` |
 | `room_invitations` | One row per invitation, kept after it resolves | `{roomId, inviteeId}` unique-partial on `pending` · `{inviteeId, status, createdAt:-1}` · `{status, expiresAt}` |
 | `notifications` | One nudge per person, expiring after 30 days | `{userId, createdAt:-1, _id:-1}` · `{userId, createdAt:-1}` partial on unread · `{expiresAt}` TTL |
+| `achievements` | One unlock per player per key | `{userId, key}` **unique** — this is the whole duplicate rule · `{userId, createdAt:-1}` |
+| `xp_events` | XP history; a log, never the authority | `{userId, createdAt:-1, _id:-1}` · `{expiresAt}` TTL (90 days) |
 
 Two shapes are worth the note:
 
@@ -513,6 +515,94 @@ sent. Each writes the row *and* emits its existing domain event — the domain
 event tells a screen its list is stale, the notification event tells the badge
 its count changed, and a client is rarely showing both.
 
+### Drawing replays
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/games/:gameId/replays` | Finished turns, **without** strokes |
+| `GET` | `/api/games/:gameId/replays/:turnNumber` | One turn, with strokes and word |
+
+**The replay data was already being stored.** `roundRepository.finish` writes
+the finished board to `rounds.snapshot` in one write at turn end — live strokes
+never touch Mongo — so this feature adds nothing to the drawing path. What it
+adds is a budget on that write, and a way to read it back.
+
+**A live turn is never served.** A replay carries the drawing *and* the word,
+so `replayService` refuses anything whose `endedAt` is unset — with the same
+`NOT_FOUND` a turn that never existed gets, so the endpoint cannot be used to
+probe for which turn is live.
+
+The list carries no strokes. A twelve-turn match's drawings together are
+megabytes; the list is a menu, and the strokes come from the second call once.
+
+**Storage budget** (`REPLAY_LIMITS`, enforced on the write by
+`compactSnapshot`): 12,000 points per snapshot, 600 per stroke, 1,200 strokes.
+When a drawing is over budget it loses **points, not strokes** — dropping a
+stroke removes something the drawer drew, while dropping every other point
+within one removes only smoothness the renderer's curve-smoothing puts back.
+Thinning is evenly spaced and pins each stroke's endpoints, and the two-point
+floor means a `line`, `rectangle` or `circle` can never be thinned below its own
+geometry. Only past the stroke ceiling — which no human drawing reaches — is
+content discarded, and then the earliest strokes are kept so what survives is
+still a drawing in progress.
+
+`RoundResultDto` now carries `gameId` and `turnNumber`, which is how a client
+names a replay: nothing in the protocol ever puts a round document id on the
+wire. They ride on the round result rather than the game state because that is
+the exact moment a replay becomes available, and a round result is sent once per
+turn where game state is sent on every hint and score change.
+
+**Timing is derived, not stored.** Strokes carry a `ts`; points inside them do
+not, and adding one would have meant a third number on the highest-frequency
+payload in the game to serve a screen nobody looks at during play. So playback
+advances through the *drawing* — every point takes the same slice of time, with
+a short beat between strokes — rather than reproducing the drawer's exact
+hesitations.
+
+### XP, levels and achievements
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/progression/me` | The caller's level plus the whole catalogue |
+| `GET` | `/api/achievements?userId=` | Any player's unlocks; defaults to the caller |
+| `GET` | `/api/progression/xp?page=&limit=` | The caller's own XP history |
+
+**Every route here is a read, and that is the design.** XP is awarded by the
+game engine from facts it owns; achievements unlock as a consequence. There is
+no endpoint through which a client sends a level, an amount or an unlock, so
+there is nothing for a modified client to forge.
+
+`XP_AWARDS` in `progression.constants.ts` is the only place an amount comes
+from. A caller of `xpService.award` names a *reason* and a count; the rate is a
+constant.
+
+**Levels** are `xpForLevel(n) = round(100 · (n-1)^1.6)`, capped at 50.
+`levelForXp` inverts it, then corrects against `xpForLevel` itself — the
+closed-form inverse disagrees at the boundaries because `xpForLevel` rounds,
+and a player holding exactly a threshold would otherwise read one level low.
+`users.xp` is the authority; `users.level` is denormalised beside it so the
+database can sort by level without recomputing a power function per row.
+
+**Achievements never pay twice.** Two things make that true together, and
+neither is sufficient alone:
+
+1. The watched counters only ever increase, so a threshold once crossed stays
+   crossed and re-evaluating is idempotent.
+2. `{userId, key}` is unique on `achievements`. The insert *is* the claim —
+   there is no read-then-write check to lose a race — and only the caller whose
+   insert succeeded pays the XP and sends the notification.
+
+**Abandoned games pay nothing**, and mostly by construction rather than by a
+check: the per-match tally lives on the in-memory seat (`RuntimePlayer.matchStats`)
+and dies with the room, so a match that never reaches `endGame` never reaches
+the progression service at all. What `isRankedMatch` adds is the match that did
+end but should not count — fewer than `MIN_PLAYERS_TO_START` players, or zero
+turns begun.
+
+XP history rows carry a 90-day TTL. They are a *log* that explains a balance,
+never the balance itself: summing them would make every profile read an
+aggregation and would go wrong the moment a row expired.
+
 ### `GET /api/health`
 
 Unauthenticated, so a load balancer probe works. Returns **503** when the
@@ -723,6 +813,53 @@ on a tablet lands in the same place on a phone. The server clamps them rather
 than rejecting — a value a hair outside the box is a rounding artefact, and
 dropping the batch would make lines stutter at the edge. The author is always
 overwritten from the authenticated socket.
+
+### Tools
+
+`t` is one of `pen`, `pencil`, `marker`, `brush`, `eraser`, `fill`, `line`,
+`rectangle`, `circle`. An unrecognised value becomes `pen` rather than a
+refusal: a client from a later release should still put a mark on the board,
+and a drawer whose strokes silently vanish for everybody is far worse than one
+drawn with the wrong nib.
+
+**Every tool is still a stroke.** A rectangle is two points and a tool name; a
+fill is a colour and a tool name. None of them is a special message — all go
+down the same `begin/append/end` path, land in the same append-only
+`board.strokes`, and are undone by the same `undo`. That is what keeps one
+ordering rule, one replay and one redo stack for the whole feature.
+
+Three families, and the server bounds each:
+
+| Family | Tools | Points | Enforcement |
+|---|---|---|---|
+| Freehand | `pen` `pencil` `marker` `brush` `eraser` | streamed | capped at `maxPointsPerStroke` |
+| Shape | `line` `rectangle` `circle` | exactly 2 | trimmed on `begin`, `append` refused |
+| Fill | `fill` | 1, unused | trimmed on `begin`, `append` refused |
+
+The `append` refusal matters as much as the trim: they are separate entry
+points, so trimming only on `begin` would leave a client free to stream four
+hundred points into a "rectangle" afterwards.
+
+**`fill` covers the whole canvas, not an enclosed region**, and that is a
+deliberate limitation. A region flood fill is a pixel operation — it needs a
+rasterised bitmap to walk, and every client here rasterises at a different size
+with different anti-aliasing. The same fill would spill past a hand-drawn gap on
+a tablet and stop at it on a phone, so the shared canvas would stop being
+shared; worse, the turn-end snapshot is a list of strokes rather than an image
+and could not record which happened. A whole-canvas fill replays identically
+everywhere, at any resolution, from two numbers.
+
+### Pressure
+
+A point is `[x, y]`, or `[x, y, pressure]` where a device reports one, with
+pressure normalised to `0..1`. Only `brush` varies its width with it, so **only
+`brush` strokes carry the third element** — points are the highest-frequency
+payload in the game, and a third number on every one of them would be a 50%
+increase on the thing sent most often.
+
+That also makes it compatible in both directions: an older client sends two
+elements and is read correctly, and a newer client's third element is ignored by
+an older server.
 
 ---
 

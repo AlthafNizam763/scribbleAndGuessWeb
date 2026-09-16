@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { ROOM_CODE, ROOM_LIMITS } from '@/constants/game.constants';
+import { LANGUAGES } from '@/constants/room.constants';
 import { drawingService } from '@/services/drawing.service';
 import { lobbyService } from '@/services/lobby.service';
 import { TimerService } from '@/services/timer.service';
@@ -102,6 +103,21 @@ describe('room settings validation', () => {
 
     expect(settings.wordMode).toBe('normal');
     expect(settings.language).toBe('en');
+  });
+
+  /**
+   * The two languages the client added last. A room may be created in
+   * either, and the pool falls back to the bundled English list where
+   * no words have been seeded — so this accepting them is what decides
+   * whether the setting survives a round trip at all.
+   */
+  it('accepts every language the client offers', () => {
+    for (const language of LANGUAGES) {
+      expect(roomSettingsSchema.parse({ language }).language).toBe(language);
+    }
+
+    expect(LANGUAGES).toContain('ta');
+    expect(LANGUAGES).toContain('ar');
   });
 
   it('drops unknown categories but keeps known ones', () => {

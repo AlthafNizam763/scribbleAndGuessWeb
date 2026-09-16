@@ -5,11 +5,17 @@ import { roomRepository } from '@/repositories/room.repository';
 import { userRepository } from '@/repositories/user.repository';
 import type { AuthenticatedUser } from '@/types/auth.types';
 import type { PlayerDto, RoomDto, RoomSettingsDto } from '@/types/room.types';
+import { TEAM } from '@/constants/gameModes.constants';
+import { emptyChat, emptyMatchStats } from '@/types/socket.types';
 import type { RuntimePlayer, RuntimeRoom } from '@/types/socket.types';
 import { errors } from '@/utils/errors';
 import { generateUniqueRoomCode, normalizeRoomCode } from '@/utils/generateRoomCode';
 import { logger } from '@/utils/logger';
+import { emitToRoom } from '@/config/socket';
+import { SERVER_ROOM_LOCKED } from '@/constants/socket.constants';
 import { notifyRoomEvent } from '@/services/room.notify';
+import { gameModeService } from '@/services/gameMode.service';
+import { spectatorService } from '@/services/spectator.service';
 import { timerService } from '@/services/timer.service';
 import { voiceService } from '@/services/voice.service';
 
@@ -60,6 +66,12 @@ export function defaultSettings(): RoomSettingsDto {
     categories: [],
     customWords: [],
     allowVoteKick: ROOM_DEFAULTS.allowVoteKick,
+    voiceEnabled: ROOM_DEFAULTS.voiceEnabled,
+    chatEnabled: ROOM_DEFAULTS.chatEnabled,
+    gameMode: ROOM_DEFAULTS.gameMode,
+    allowSpectators: ROOM_DEFAULTS.allowSpectators,
+    friendsOnly: ROOM_DEFAULTS.friendsOnly,
+    wordDifficulty: ROOM_DEFAULTS.wordDifficulty,
     isPrivate: ROOM_DEFAULTS.isPrivate,
   };
 }
@@ -155,6 +167,9 @@ export class RoomService {
       board: { strokes: [], redoStack: [] },
       voteKick: null,
       voice: { members: new Map() },
+      chat: emptyChat(),
+      spectators: new Map(),
+      locked: false,
       timers: new Map(),
       emptySince: Date.now(),
       closed: false,
@@ -206,6 +221,9 @@ export class RoomService {
       board: { strokes: [], redoStack: [] },
       voteKick: null,
       voice: { members: new Map() },
+      chat: emptyChat(),
+      spectators: new Map(),
+      locked: false,
       timers: new Map(),
       emptySince: Date.now(),
       closed: false,
@@ -230,6 +248,8 @@ export class RoomService {
         joinedAt: new Date(stored.joinedAt ?? Date.now()).getTime(),
         lastSeenAt: Date.now(),
         disconnectDeadline: Date.now() + TIMING.reconnectGraceMs,
+        matchStats: emptyMatchStats(),
+        team: TEAM.none,
       });
     }
 
@@ -334,6 +354,8 @@ export class RoomService {
       joinedAt: now,
       lastSeenAt: now,
       disconnectDeadline: null,
+      matchStats: emptyMatchStats(),
+      team: TEAM.none,
     };
 
     room.players.set(user.id, player);
@@ -375,7 +397,16 @@ export class RoomService {
       return { player: existing, rejoined: true };
     }
 
-    if (room.players.size >= room.settings.maxPlayers) throw errors.roomFull();
+    // The host's lock. Checked after the rejoin branch above on purpose: a
+    // locked room still lets its own people back in after a dropped
+    // connection, which is what makes locking safe to use mid-match.
+    if (room.locked) {
+      throw errors.invalidAction('That room is locked.');
+    }
+
+    // The mode's ceiling as well as the room's — a Duo room holds two people
+    // however its `maxPlayers` was left.
+    if (room.players.size >= gameModeService.seatLimit(room)) throw errors.roomFull();
 
     // Mid-match joining is allowed while the game is running but not during
     // the final scoreboard: a player who arrives then would sit through the
@@ -481,10 +512,50 @@ export class RoomService {
     // over its own limit, so the floor is the current occupancy.
     const maxPlayers = Math.max(settings.maxPlayers, room.players.size);
 
+    const wasSpectatable = room.settings.allowSpectators;
+
     room.settings = { ...settings, maxPlayers };
     room.totalRounds = settings.rounds;
 
+    // A host switching spectating off means "nobody watches", not "no *new*
+    // watchers" — so the gallery is emptied rather than grandfathered.
+    if (wasSpectatable && !settings.allowSpectators) {
+      spectatorService.clear(room, 'spectating_disabled');
+    }
+
     await this.persist(room);
+  }
+
+  /**
+   * Locks or unlocks the room against new arrivals. Host only.
+   *
+   * Distinct from making the room private. Private decides whether it is
+   * *listed*; locked decides whether it is *joinable* — so a host can keep a
+   * public room in the browser while stopping strangers walking into the game
+   * they have already started. Nobody seated is affected either way.
+   */
+  async setLocked(room: RuntimeRoom, actorId: string, locked: boolean): Promise<void> {
+    this.assertHost(room, actorId);
+
+    if (room.locked === locked) return;
+    room.locked = locked;
+
+    emitToRoom(room.roomId, SERVER_ROOM_LOCKED, { locked });
+    logger.info('room lock changed', { roomId: room.roomId, locked });
+
+    await this.persist(room);
+  }
+
+  /**
+   * Ends the room for everybody. Host only.
+   *
+   * A deliberate act, distinct from the sweeper closing an empty room: the
+   * host is telling a room full of people that the session is over, so it goes
+   * through `close`, which broadcasts the reason and disconnects the seats.
+   */
+  async endRoom(room: RuntimeRoom, actorId: string): Promise<void> {
+    this.assertHost(room, actorId);
+    await this.close(room, 'host_ended');
   }
 
   /** Sets the ready flag for one player. */
@@ -558,6 +629,7 @@ export class RoomService {
       guessOrder: player.guessOrder,
       isMuted: player.isMuted,
       connection: player.connection,
+      team: player.team,
     };
   }
 
@@ -578,6 +650,8 @@ export class RoomService {
       status: statusFor(room),
       createdAtMs: room.createdAtMs,
       bannedIds: [...room.bannedIds],
+      spectators: spectatorService.serialize(room),
+      locked: room.locked,
     };
   }
 }

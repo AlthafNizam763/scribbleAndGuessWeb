@@ -7,6 +7,7 @@ import {
   WORD_CATEGORIES,
   WORD_MODES,
   CONNECTION,
+  WORD_DIFFICULTIES,
 } from '@/constants/room.constants';
 
 /**
@@ -79,6 +80,41 @@ const roomSettingsSchema = new Schema(
     categories: { type: [String], enum: WORD_CATEGORIES, default: [] },
     customWords: { type: [String], default: [] },
     allowVoteKick: { type: Boolean, default: ROOM_DEFAULTS.allowVoteKick },
+    /**
+     * Whether guessers may talk to each other, and whether the text channel
+     * is open.
+     *
+     * Room settings rather than client preferences, because both are things a
+     * host decides for everybody — and because a client that could decide its
+     * own would be deciding whether the server relays other people's audio to
+     * it. `voiceService.assertMayUseVoice` and the chat handler both read
+     * these, so turning either off is enforced where it matters rather than
+     * only hiding a button.
+     *
+     * Neither ever affects guessing: a room with chat off still accepts
+     * guesses, because guessing is how the game is played.
+     */
+    voiceEnabled: { type: Boolean, default: ROOM_DEFAULTS.voiceEnabled },
+    chatEnabled: { type: Boolean, default: ROOM_DEFAULTS.chatEnabled },
+
+    /**
+     * Which rule set the match runs under.
+     *
+     * A plain string rather than an enum of the current catalogue, for the
+     * same reason a stroke's tool is: a room stored under a mode that is later
+     * retired must still load. Unknown modes resolve to Classic at read time
+     * via modeRules, so an old row plays rather than failing to start.
+     */
+    gameMode: { type: String, default: ROOM_DEFAULTS.gameMode },
+
+    /** Whether people may watch once every seat is taken. */
+    allowSpectators: { type: Boolean, default: ROOM_DEFAULTS.allowSpectators },
+
+    /** Whether only the host's friends may join by code. */
+    friendsOnly: { type: Boolean, default: ROOM_DEFAULTS.friendsOnly },
+
+    /** Narrows the word pool. Null lets the mode or the room decide. */
+    wordDifficulty: { type: String, enum: [...WORD_DIFFICULTIES, null], default: null },
     isPrivate: { type: Boolean, default: ROOM_DEFAULTS.isPrivate },
   },
   { _id: false },

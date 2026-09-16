@@ -15,8 +15,22 @@ import type { DrawToolWire } from '@/constants/room.constants';
  * stroke drawn on a tablet lands in the same place on a phone.
  */
 
-/** A single point as the compact two-element array the client sends. */
-export type PointTuple = [number, number];
+/**
+ * A single point: `[x, y]`, or `[x, y, pressure]` where a device reports it.
+ *
+ * ## Why pressure is optional rather than always present
+ *
+ * Points are the highest-frequency payload in the game, and a third number on
+ * every one of them is a 50% increase on the thing sent most often. Only the
+ * `brush` tool varies its width with pressure, so only `brush` strokes carry
+ * it — every other tool sends the two-element form it always sent.
+ *
+ * That also makes the change backwards compatible in both directions: an older
+ * client sends two elements and is read correctly, and a newer client's third
+ * element is ignored by an older server. `pressure` is 0..1, where 0.5 is the
+ * neutral value a device with no pressure sensor reports.
+ */
+export type PointTuple = [number, number] | [number, number, number];
 
 /** `lib/models/stroke.dart`. */
 export interface StrokeDto {

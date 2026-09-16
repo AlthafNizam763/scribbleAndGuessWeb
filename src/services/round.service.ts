@@ -24,6 +24,8 @@ export class RoundService {
       .filter((round) => round.endedAt !== null)
       .map((round) => ({
         round: round.roundNumber,
+        gameId: String(round.gameId),
+        turnNumber: round.turnNumber,
         word: round.word ?? '',
         drawerId: String(round.drawerId),
         scoreDeltas: Object.fromEntries(

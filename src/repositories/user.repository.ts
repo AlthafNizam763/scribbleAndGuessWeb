@@ -1,6 +1,7 @@
 import { Types } from 'mongoose';
 
 import { User, type UserDocument } from '@/models/User';
+import { maskProfanity } from '@/utils/wordFilter';
 import type { AuthProvider } from '@/types/auth.types';
 
 /**
@@ -47,13 +48,36 @@ export const userRepository = {
     return User.findOne({ email: email.trim().toLowerCase() }).lean().exec();
   },
 
-  /** Updates the profile fields a player is allowed to change. */
+  /**
+   * Updates the profile fields a player is allowed to change.
+   *
+   * The `Pick` is the permission: there is no path through this method by
+   * which a score, a counter, an XP total or a level could be written, so a
+   * client cannot set one however it shapes its request. Everything else on
+   * the row is written by the game engine.
+   *
+   * The bio is masked rather than refused. It is free text on a public
+   * profile, so it goes through the same filter chat does — and masking is the
+   * kinder failure for a false positive: the profile still saves, with one
+   * word starred, instead of an error the player cannot act on.
+   */
   async updateProfile(
     id: string,
-    patch: Partial<Pick<UserDocument, 'username' | 'avatarId' | 'avatarColorIndex'>>,
+    patch: Partial<
+      Pick<
+        UserDocument,
+        'username' | 'avatarId' | 'avatarColorIndex' | 'bio' | 'profileFrame' | 'profileTheme'
+      >
+    >,
   ) {
     if (!isObjectId(id)) return null;
-    return User.findByIdAndUpdate(id, { $set: patch }, { new: true, runValidators: true })
+
+    const safe =
+      typeof patch.bio === 'string'
+        ? { ...patch, bio: maskProfanity(patch.bio).text }
+        : patch;
+
+    return User.findByIdAndUpdate(id, { $set: safe }, { new: true, runValidators: true })
       .lean()
       .exec();
   },

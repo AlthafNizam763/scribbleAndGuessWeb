@@ -20,6 +20,11 @@ import {
   SERVER_VOICE_STATE,
   ROOM_EVENTS,
   roomChannel,
+  CLIENT_ROOM_SPECTATE,
+  CLIENT_ROOM_UNSPECTATE,
+  CLIENT_ROOM_LOCK,
+  CLIENT_ROOM_END,
+  SERVER_ROOM_SPECTATORS,
 } from '@/constants/socket.constants';
 import { parsePayload } from '@/middleware/validation.middleware';
 import {
@@ -39,6 +44,7 @@ import { gameService } from '@/services/game.service';
 import { invitationService } from '@/services/invitation.service';
 import { matchmakingService } from '@/services/matchmaking.service';
 import { moderationService } from '@/services/moderation.service';
+import { spectatorService } from '@/services/spectator.service';
 import { presenceService } from '@/services/presence.service';
 import { roomService, defaultSettings } from '@/services/room.service';
 import { voiceService } from '@/services/voice.service';
@@ -465,3 +471,90 @@ async function leaveCurrentRoom(socket: GameSocket, keepRoomId?: string): Promis
 }
 
 export { enterRoom };
+
+/**
+ * Spectating, and the host's remaining switches.
+ *
+ * ## Why spectating has its own handlers
+ *
+ * A seat and a gallery place are different things with different rules — one
+ * counts towards the minimum, takes turns and scores; the other does none of
+ * those. Overloading the join handler with a flag would put both sets of rules
+ * in one place, and the failure mode is a watcher who ends up in the turn
+ * order.
+ */
+export function registerSpectatorHandlers(socket: GameSocket): void {
+  on(
+    socket,
+    CLIENT_ROOM_SPECTATE,
+    async (_ctx, payload) => {
+      const body = parsePayload(payload, joinRoomSchema);
+      const code = body.roomCode ?? body.code ?? '';
+
+      const room = await roomService.resolveByCode(code);
+      if (!room) throw errors.roomNotFound();
+
+      // A player cannot watch a room they hold a seat in, and cannot hold a
+      // seat in two rooms — so the seat they already have is checked first.
+      const seated = roomService.liveRoomOf(socket.data.user.id);
+      if (seated && seated.roomId !== room.roomId) {
+        throw errors.invalidAction('Leave your current room first.');
+      }
+
+      spectatorService.join(room, socket);
+
+      emitToRoom(room.roomId, SERVER_ROOM_SPECTATORS, {
+        spectators: spectatorService.serialize(room),
+      });
+
+      return {
+        room: roomService.serializeRoom(room),
+        // Announced explicitly rather than left for the client to infer from
+        // its absence in `players` — a client that guessed wrong would show a
+        // drawing toolbar to somebody who cannot draw.
+        spectating: true,
+      };
+    },
+    { limit: 'joinRoom' },
+  );
+
+  on(
+    socket,
+    CLIENT_ROOM_UNSPECTATE,
+    ({ room, userId, socket: sock }) => {
+      const left = spectatorService.leave(room, userId, sock.id);
+
+      if (left) {
+        emitToRoom(room.roomId, SERVER_ROOM_SPECTATORS, {
+          spectators: spectatorService.serialize(room),
+        });
+      }
+
+      return {};
+    },
+    { limit: 'action', requiresRoom: true },
+  );
+
+  on(
+    socket,
+    CLIENT_ROOM_LOCK,
+    async ({ room, userId }, payload) => {
+      const body = (payload ?? {}) as { locked?: unknown };
+      const locked = body.locked !== false;
+
+      await roomService.setLocked(room, userId, locked);
+      return { locked };
+    },
+    { limit: 'moderation', requiresRoom: true },
+  );
+
+  on(
+    socket,
+    CLIENT_ROOM_END,
+    async ({ room, userId }) => {
+      await roomService.endRoom(room, userId);
+      return {};
+    },
+    { limit: 'moderation', requiresRoom: true },
+  );
+}

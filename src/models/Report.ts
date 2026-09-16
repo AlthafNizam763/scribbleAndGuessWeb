@@ -1,6 +1,7 @@
 import { Schema, Types, model, models, type InferSchemaType, type Model } from 'mongoose';
 
 import { INPUT_LIMITS } from '@/constants/game.constants';
+import { REPORT_STATUS, REPORT_STATUSES } from '@/constants/social.constants';
 
 /**
  * A player report (brief section 44).
@@ -20,6 +21,27 @@ const reportSchema = new Schema(
     reportedUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     reporterUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     reason: { type: String, required: true, trim: true, maxlength: INPUT_LIMITS.maxReportLength },
+    /**
+     * Where the report is in its lifecycle.
+     *
+     * A reviewed report is never deleted — the second report against an
+     * account matters far more when the first was upheld, and removing
+     * resolved rows would throw that away.
+     */
+    status: {
+      type: String,
+      enum: REPORT_STATUSES,
+      default: REPORT_STATUS.pending,
+      required: true,
+    },
+
+    /** Who resolved it, and when. Null while pending. */
+    reviewedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    reviewedAt: { type: Date, default: null },
+
+    /** A reviewer's note. Never shown to either player. */
+    reviewNote: { type: String, trim: true, maxlength: 280, default: '' },
+
     /** Context for a reviewer: what was on screen when the report was filed. */
     gameId: { type: Schema.Types.ObjectId, ref: 'Game', default: null },
   },
@@ -33,6 +55,18 @@ reportSchema.index(
   { unique: true },
 );
 reportSchema.index({ reportedUserId: 1, createdAt: -1 });
+
+/**
+ * The review queue: everything pending, oldest first.
+ *
+ * A partial index over pending rows only. The alternative — indexing `status`
+ * across the whole collection — would index every report ever resolved to
+ * answer a question that only concerns the handful nobody has looked at yet.
+ */
+reportSchema.index(
+  { createdAt: 1 },
+  { partialFilterExpression: { status: REPORT_STATUS.pending } },
+);
 
 export type ReportDocument = InferSchemaType<typeof reportSchema> & { _id: Types.ObjectId };
 

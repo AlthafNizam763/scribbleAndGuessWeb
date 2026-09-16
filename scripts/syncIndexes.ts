@@ -4,6 +4,7 @@ import { Block } from '@/models/Block';
 import { ChatMessage } from '@/models/ChatMessage';
 import { FriendRequest } from '@/models/FriendRequest';
 import { Friendship } from '@/models/Friendship';
+import { Achievement } from '@/models/Achievement';
 import { Game } from '@/models/Game';
 import { Notification } from '@/models/Notification';
 import { Report } from '@/models/Report';
@@ -12,6 +13,7 @@ import { RoomInvitation } from '@/models/RoomInvitation';
 import { Round } from '@/models/Round';
 import { User } from '@/models/User';
 import { Word } from '@/models/Word';
+import { XpEvent } from '@/models/XpEvent';
 import { logger } from '@/utils/logger';
 
 /**
@@ -57,6 +59,8 @@ const MODELS: SyncableModel[] = [
   Round,
   Word,
   Notification,
+  Achievement,
+  XpEvent,
   ChatMessage,
   Report,
   FriendRequest,
@@ -75,6 +79,8 @@ const PLAY_DATA: SyncableModel[] = [
   Round,
   ChatMessage,
   Notification,
+  Achievement,
+  XpEvent,
   Report,
   FriendRequest,
   Friendship,

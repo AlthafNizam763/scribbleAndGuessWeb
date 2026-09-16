@@ -1,3 +1,4 @@
+import { levelForXp, titleForLevel } from '@/constants/progression.constants';
 import type {
   LeaderboardRowDto,
   LocalityDto,
@@ -32,6 +33,18 @@ export interface RankableUser {
   gamesPlayed: number;
   gamesWon: number;
   bestRoundScore: number;
+  bio?: string | null;
+  profileFrame?: string | null;
+  profileTheme?: string | null;
+  favoriteCategory?: string | null;
+  /**
+   * Optional because the leaderboard projections do not always select them,
+   * and because rows written before the progression feature landed have
+   * neither. Both default to a level-1 account, which is what an account with
+   * no XP is.
+   */
+  xp?: number | null;
+  level?: number | null;
   city?: string | null;
   region?: string | null;
   country?: string | null;
@@ -63,12 +76,23 @@ export function toUserStats(user: RankableUser): UserStatsDto {
   const played = Math.max(0, user.gamesPlayed);
   const won = Math.max(0, user.gamesWon);
 
+  // Derived from `xp` rather than read from `level`, for the same reason the
+  // win rate is derived: a stored level that disagrees with the XP beside it
+  // is a third number, and the only way to keep it honest is to recompute it.
+  // The stored `level` exists so the *database* can sort by it, not so this
+  // can read it.
+  const xp = Math.max(0, user.xp ?? 0);
+  const level = levelForXp(xp);
+
   return {
     totalScore: user.totalScore,
     gamesPlayed: played,
     gamesWon: won,
     winRate: played === 0 ? 0 : Math.round((won / played) * 1000) / 10,
     bestRoundScore: user.bestRoundScore,
+    xp,
+    level,
+    levelTitle: titleForLevel(level),
   };
 }
 
