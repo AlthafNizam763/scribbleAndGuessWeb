@@ -1,3 +1,4 @@
+import { env } from '@/config/env';
 import { emitToRoom } from '@/config/socket';
 import { BOT_LIMITS, type BotDifficultyWire } from '@/constants/autoTournament.constants';
 import { CHAT_TYPE, GAME_PHASE } from '@/constants/room.constants';
@@ -98,6 +99,15 @@ interface BotTask {
   timer: NodeJS.Timeout | null;
   /** Remaining drawing steps, for a drawer. */
   steps: DrawStep[];
+  /**
+   * The drawing session these steps belong to, for a drawer.
+   *
+   * Checked before every packet alongside the round id. The round id alone
+   * would not catch the case this exists for: a second plan built for the same
+   * turn — a reconnect, a repeated broadcast — whose steps would interleave
+   * with the first plan's and put two half-drawings on one board.
+   */
+  drawingSessionId: string | null;
   /** Words already tried this turn, for a guesser. */
   tried: Set<string>;
   attempts: number;
@@ -116,6 +126,30 @@ const globalTasks = globalThis as typeof globalThis & {
 };
 
 const tasks: Map<string, Map<string, BotTask>> = (globalTasks.__scribbleBotTasks ??= new Map());
+
+/**
+ * Drawing sessions that have already been started, by room.
+ *
+ * ## Why a plan may only be used once
+ *
+ * `reconcile` runs on every broadcast, and a drawing turn broadcasts often — a
+ * hint lands, a guesser scores, somebody reconnects. The `kind` check stops
+ * the common repeat, but it is a check on *live* state: a bot whose task has
+ * just finished its last step, or was cancelled and re-created, presents no
+ * live task at all and would be planned again from the top. The board would
+ * then get the same picture twice, drawn over itself, in the same round.
+ *
+ * So a session is recorded when it starts and refused if it comes back. The
+ * set is cleared with the room's tasks, which happens at the end of every turn
+ * — so the key can be reused next round with a new `roundId` and never within
+ * one.
+ */
+const globalSessions = globalThis as typeof globalThis & {
+  __scribbleBotSessions?: Map<string, Set<string>>;
+};
+
+const startedSessions: Map<string, Set<string>> = (globalSessions.__scribbleBotSessions ??=
+  new Map());
 
 /** How many bots hold a live timer right now, across every room. */
 function workerCount(): number {
@@ -246,9 +280,16 @@ export class BotPlayerService {
       return;
     }
 
-    const task = this.claim(room, drawer.userId, round.roundId, 'drawing');
-    if (!task) return;
+    // Everything a plan is bound to, all of it server state. `gameId` falls
+    // back to the room id, which is what identifies a match before the game
+    // row exists — a bot can be drawing in a warm-up turn.
+    const session = {
+      gameId: room.gameId ?? room.roomId,
+      roundId: round.roundId,
+      botId: drawer.botId ?? drawer.userId,
+    };
 
+    const startedAtMs = Date.now();
     const plan = botDrawerService.plan({
       // The drawer's own word, which is what the server already told the
       // drawer. Read from the round rather than from a serialisation, because
@@ -256,22 +297,72 @@ export class BotPlayerService {
       word: round.word,
       difficulty: drawer.botDifficulty ?? 'NORMAL',
       authorId: drawer.userId,
-      turnMs: Math.max(1_000, round.turnEndMs - Date.now()),
+      turnMs: Math.max(1_000, round.turnEndMs - startedAtMs),
+      session,
     });
 
-    if (!plan.matchedTemplate) {
-      // Logged without the word, like every other line in the engine: a log
-      // anybody can read is not the place for a live round's answer. The
-      // length and difficulty are enough to find the gap in the library.
-      logger.warn('bot drawing fell back to a generic template', {
+    if (!plan.ok) {
+      // The gap in the library, named so it can be closed. The word itself is
+      // printed only in development — a production log anybody can read is not
+      // the place for a live round's answer — and the length and difficulty
+      // are enough to find it in the bank afterwards.
+      logger.warn('missing bot drawing template', {
         roomId: room.roomId,
         botId: drawer.botId,
+        reason: plan.reason,
         wordLength: round.word.length,
         difficulty: round.wordDifficulty,
+        ...(env.isProduction ? {} : { word: plan.normalizedWord }),
       });
+      if (!env.isProduction) {
+        logger.debug(`Missing bot drawing template: ${plan.normalizedWord}`);
+      }
+
+      // Sitting the turn out is the point: the bot does not draw some other
+      // word's picture, and the round plays out on the hints instead.
+      this.cancelTask(room.roomId, drawer.userId);
+      return;
+    }
+
+    // A plan for a session already under way. See `startedSessions`.
+    const sessions = startedSessions.get(room.roomId);
+    if (sessions?.has(plan.drawingSessionId)) return;
+
+    const task = this.claim(room, drawer.userId, round.roundId, 'drawing');
+    if (!task) return;
+
+    if (sessions) {
+      sessions.add(plan.drawingSessionId);
+    } else {
+      startedSessions.set(room.roomId, new Set([plan.drawingSessionId]));
     }
 
     task.steps = plan.steps;
+    task.drawingSessionId = plan.drawingSessionId;
+
+    // The development line the brief asks for: the selected word and the
+    // template key printed together, before a single packet goes out, so a
+    // mismatch is visible in the log rather than only on the canvas.
+    if (!env.isProduction) {
+      logger.debug(
+        [
+          '[BotDrawing]',
+          `tournament=${room.tournament?.tournamentId ?? '-'}`,
+          `game=${session.gameId}`,
+          `round=${session.roundId}`,
+          `bot=${drawer.username}`,
+          `botId=${session.botId}`,
+          `word=${round.word}`,
+          `normalizedWord=${plan.normalizedWord}`,
+          `templateKey=${plan.templateKey}`,
+          `session=${plan.drawingSessionId}`,
+          `strokeCount=${plan.strokeCount}`,
+          `startedAt=${new Date(startedAtMs).toISOString()}`,
+          `plannedFinishAt=${new Date(startedAtMs + plan.totalMs).toISOString()}`,
+        ].join(' '),
+      );
+    }
+
     this.runNextDrawStep(room, task, round.roundId);
   }
 
@@ -279,6 +370,11 @@ export class BotPlayerService {
   private runNextDrawStep(room: RuntimeRoom, task: BotTask, roundId: string): void {
     const step = task.steps.shift();
     if (!step) {
+      if (!env.isProduction && task.drawingSessionId) {
+        logger.debug(
+          `[BotDrawing] finished session=${task.drawingSessionId} at=${new Date().toISOString()}`,
+        );
+      }
       this.cancelTask(room.roomId, task.playerId);
       return;
     }
@@ -296,6 +392,16 @@ export class BotPlayerService {
       }
       if (room.phase !== GAME_PHASE.drawing || round.drawerId !== task.playerId) {
         this.cancelTask(room.roomId, task.playerId);
+        return;
+      }
+      // The task this timer belongs to is no longer the room's task for this
+      // seat — it was replaced between the step being booked and firing. The
+      // round id above cannot see that, because the replacement is in the same
+      // round. Only this task stops: cancelling by seat here would kill the
+      // replacement, which is the live drawing.
+      if (tasks.get(room.roomId)?.get(task.playerId) !== task) {
+        task.cancelled = true;
+        task.steps = [];
         return;
       }
 
@@ -538,6 +644,7 @@ export class BotPlayerService {
       roundId,
       timer: null,
       steps: [],
+      drawingSessionId: null,
       tried: new Set(),
       attempts: 0,
       cancelled: false,
@@ -576,6 +683,11 @@ export class BotPlayerService {
    * rather than only from the one that seems to matter.
    */
   clearRoom(roomId: string): void {
+    // Dropped unconditionally, before the early return: a room whose last task
+    // has already finished still holds its used-session keys, and those are
+    // exactly what must not survive into the next turn.
+    startedSessions.delete(roomId);
+
     const perRoom = tasks.get(roomId);
     if (!perRoom) return;
 
@@ -584,6 +696,7 @@ export class BotPlayerService {
       if (task.timer) clearTimeout(task.timer);
       task.timer = null;
       task.steps = [];
+      task.drawingSessionId = null;
     }
     tasks.delete(roomId);
   }

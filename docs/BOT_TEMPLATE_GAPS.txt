@@ -1,0 +1,51 @@
+animals/medium (19/30): kangaroo, hedgehog, squirrel, flamingo, peacock, rhino, hippo, koala, raccoon, seahorse, jellyfish, ostrich, walrus, gorilla, beaver, parrot, deer, wolf, swan
+
+animals/hard (20/20): platypus, chameleon, armadillo, pelican, meerkat, sloth, narwhal, praying mantis, hermit crab, anteater, porcupine, woodpecker, tadpole, caterpillar, scorpion, lobster, iguana, toucan, puffin, mole
+
+food/easy (2/30): milk, candy cane
+
+food/medium (25/30): spaghetti, sushi, pancakes, waffle, pretzel, croissant, bacon, salad bowl, soup, muffin, pie slice, french fries, noodles, dumpling, coconut, honey jar, jam jar, birthday cake, chocolate bar, cereal bowl, milkshake, smoothie, hot sauce, olive, toast
+
+food/hard (20/20): spring roll, gingerbread man, banana split, wedding cake, fortune cookie, cheese board, waffle cone, corn dog, candy apple, cotton candy, marshmallow, pomegranate, artichoke, asparagus, cinnamon roll, baguette, kebab, lasagna, omelette, sundae
+
+objects/easy (1/30): brush
+
+objects/medium (15/30): microscope, wheelbarrow, sewing machine, typewriter, chandelier, birdcage, trampoline, vacuum cleaner, ironing board, magnifying glass, paint roller, rocking chair, alarm clock, jigsaw puzzle, wind chime
+
+objects/hard (20/20): grandfather clock, treasure chest, music box, snow globe, weather vane, gramophone, kaleidoscope, metal detector, fire extinguisher, vending machine, jukebox, hot-air balloon, pocket watch, xylophone, accordion, marionette, chess set, dartboard, disco ball, birdhouse
+
+places/easy (14/30): hospital, bank, market, museum, library, airport, hotel, city, village, desert, forest, bakery, playground, bus stop
+
+places/medium (23/30): campsite, swimming pool, movie theater, gas station, fire station, police station, train station, post office, greenhouse, skate park, ice rink, race track, shopping mall, amusement park, roller coaster, water park, bowling alley, art gallery, cathedral, stadium, harbor, farmhouse, circus tent
+
+places/hard (20/20): ghost town, space station, pirate ship, hot spring, rice field, corn maze, flea market, drive-in theater, lemonade stand, observatory, aquarium, planetarium, wishing well, cottage, monastery, log cabin, fishing pier, toll booth, ski resort, ancient ruins
+
+movies/easy (29/30): Titanic, Frozen, Up, Shrek, Bambi, Dumbo, Tarzan, Aladdin, Cinderella, Pinocchio, Mulan, Moana, Coco, Brave, Ratatouille, Snow White, Peter Pan, Toy Story, Finding Nemo, Lion King, Batman, Superman, Spider-Man, Minions, Wall-E, Elsa, Olaf, Woody, Buzz Lightyear
+
+movies/medium (30/30): Jurassic Park, Star Wars, Harry Potter, Jaws, Avatar, Rocky, Ghostbusters, Gremlins, Zootopia, Tangled, Encanto, Luca, Rapunzel, Ariel, Wreck-It Ralph, Baymax, Madagascar, Ice Age, Happy Feet, Chicken Run, Shark Tale, Sulley, Yoda, Chewbacca, Darth Vader, Hermione, Hagrid, Gandalf, Frodo, Gollum
+
+movies/hard (20/20): Indiana Jones, Doc Brown, King Kong, Godzilla, Mary Poppins, Willy Wonka, Forrest Gump, Home Alone, Jumanji, Hercules, Pocahontas, Fantasia, Robin Hood, Stitch, Mowgli, Scooby-Doo, Pink Panther, Charlie Chaplin, Mad Hatter, Cheshire Cat
+
+sports/easy (13/30): running, cycling, surfing, skating, bowling, hockey, volleyball, rugby, karate, diving, sailing, stopwatch, referee
+
+sports/medium (30/30): badminton, archery, gymnastics, wrestling, fencing, rowing, climbing, snowboarding, skateboarding, horse riding, ice hockey, table tennis, water polo, high jump, long jump, pole vault, hurdles, marathon, javelin, discus, shot put, sumo, judo, taekwondo, cheerleading, dodgeball, kayaking, rafting, paragliding, bungee jumping
+
+sports/hard (20/20): curling, polo, cricket bat, lacrosse, triathlon, relay race, penalty kick, slam dunk, home run, figure skating, synchronized swimming, weightlifting, hang gliding, windsurfing, kitesurfing, mountain biking, scuba diving, finish line, goalkeeper, tug-of-war
+
+jobs/easy (6/30): driver, barber, librarian, dentist, plumber, mail carrier
+
+jobs/medium (29/30): detective, mechanic, carpenter, electrician, architect, journalist, lifeguard, veterinarian, pharmacist, hairdresser, tailor, butcher, fisherman, shepherd, beekeeper, blacksmith, lumberjack, miner, archaeologist, flight attendant, bus driver, train conductor, news anchor, juggler, acrobat, puppeteer, zookeeper, park ranger, barista
+
+jobs/hard (20/20): astronomer, cartographer, glassblower, locksmith, watchmaker, chimney sweep, sculptor, orchestra conductor, stunt double, tattoo artist, cameraman, window cleaner, street sweeper, snake charmer, balloon artist, farrier, marine biologist, storm chaser, dog walker, tour guide
+
+technology/easy (11/30): computer mouse, earbuds, remote control, calculator, tablet, smartwatch, usb stick, wifi router, microwave, washing machine, refrigerator
+
+technology/medium (28/30): game console, joystick, vr headset, solar panel, wind turbine, electric car, charging cable, power bank, hard drive, circuit board, motherboard, laser printer, barcode scanner, security camera, smart speaker, fingerprint scanner, touchscreen, memory card, antenna, telegraph, floppy disk, cassette tape, vinyl record, projector, walkie-talkie, conveyor belt, escalator, cash register
+
+technology/hard (19/20): space shuttle, space rover, hovercraft, jetpack, flight simulator, particle accelerator, power plant, radio telescope, weather balloon, robot arm, server rack, dial-up modem, punch card, radar dish, smart doorbell, lunar lander, hologram, laser pointer, steam engine
+
+nature/easy (9/30): lake, sea, wind, acorn, pinecone, icicle, wave, hill, bush
+
+nature/medium (24/30): canyon, glacier, thunderstorm, earthquake, avalanche, sunset, sunrise, eclipse, meteor, galaxy, tide pool, coral reef, sand dune, oasis, swamp, jungle, meadow, valley, cliff, tree stump, vine, moss, fern, clover
+
+nature/hard (15/20): northern lights, storm cloud, milky way, geyser, stalactite, quicksand, dew drop, anthill, toadstool, lily pad, cattail, tumbleweed, driftwood, seaweed, bamboo grove

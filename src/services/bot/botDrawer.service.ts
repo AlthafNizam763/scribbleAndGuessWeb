@@ -3,10 +3,8 @@ import {
   BOT_LIMITS,
   type BotDifficultyWire,
 } from '@/constants/autoTournament.constants';
-import { templateFor } from '@/services/bot/drawingTemplates';
+import { hasTemplate, resolveTemplate, strokesFor } from '@/services/bot/drawingTemplates';
 import type { PointTuple, StrokeDto } from '@/types/drawing.types';
-import { logger } from '@/utils/logger';
-import { normalizeGuess } from '@/utils/normalizeGuess';
 import { newId, randomBelow } from '@/utils/random';
 
 /**
@@ -39,6 +37,15 @@ import { newId, randomBelow } from '@/utils/random';
  * how much the hand shakes. An EASY bot draws seven tenths of a wobbly apple
  * slowly; a HARD bot draws all of a steady one quickly. None of them draws a
  * *different* apple, because the drawing is not where a match should be won.
+ *
+ * ## Why a plan can come back as a miss
+ *
+ * Because the honest answer to "draw a platypus" is that this library cannot,
+ * and the alternative that used to be here — a generic face for every word it
+ * did not know — was worse than silence: a guesser cannot tell a bot with
+ * nothing to say from one that is confidently drawing the wrong thing. A miss
+ * is returned, the caller logs which word to add, and the bot sits the turn
+ * out. See the note in `drawingTemplates.ts`.
  */
 
 /** One step of a drawing plan. */
@@ -47,12 +54,38 @@ export type DrawStep =
   | { kind: 'append'; delayMs: number; strokeId: string; points: PointTuple[] }
   | { kind: 'end'; delayMs: number; strokeId: string };
 
+/** A plan that will be drawn. */
 export interface DrawPlan {
+  ok: true;
   steps: DrawStep[];
-  /** Whether a real template was found, so the caller can log a miss once. */
-  matchedTemplate: boolean;
+  /** The word after normalisation, for the development log. */
+  normalizedWord: string;
+  /** The template this plan was built from. Always equal to `normalizedWord`. */
+  templateKey: string;
+  /** Strokes in the plan, after the difficulty cut. */
+  strokeCount: number;
+  /** The session this plan belongs to. Nothing else may replay it. */
+  drawingSessionId: string;
   /** How long the whole plan takes, for the log and for the tests. */
   totalMs: number;
+}
+
+/** A turn this bot will sit out, and why. */
+export interface NoDrawPlan {
+  ok: false;
+  normalizedWord: string;
+  reason: 'no-template' | 'empty-template' | 'invalid-points' | 'key-mismatch';
+}
+
+export type PlanResult = DrawPlan | NoDrawPlan;
+
+/** What binds a plan to one turn. Every field is server state. */
+export interface DrawSession {
+  /** `room.gameId`, or the room id before a game has an id. */
+  gameId: string;
+  roundId: string;
+  /** The bot's roster id — `scribbler`, `doodler` — not its user id. */
+  botId: string;
 }
 
 export class BotDrawerService {
@@ -73,6 +106,15 @@ export class BotDrawerService {
    * interval is compressed when a template is long or a turn is short, and the
    * stroke count is capped outright, which is also what stops a template bug
    * from filling a board.
+   *
+   * ## Why it validates its own output
+   *
+   * Because every one of these checks is a bug that actually reached a canvas
+   * once: a word drawing another word's picture, a template that built an
+   * empty stroke list, a coordinate outside the unit square that the client
+   * clamped into a straight line through the middle of a curve. They are cheap
+   * — one pass over a few hundred points, once per turn — and each one turns a
+   * silent wrong drawing into a logged skip.
    */
   plan(input: {
     word: string;
@@ -80,11 +122,34 @@ export class BotDrawerService {
     authorId: string;
     /** How long the turn runs, so the plan can be made to fit inside it. */
     turnMs: number;
-  }): DrawPlan {
-    const { word, difficulty, authorId, turnMs } = input;
+    session: DrawSession;
+  }): PlanResult {
+    const { word, difficulty, authorId, turnMs, session } = input;
+
+    const { normalizedWord, templateKey } = resolveTemplate(word);
+
+    // Nothing draws this word. The caller logs it and the bot sits out; it
+    // does not draw something else, which is what used to happen.
+    if (templateKey === null) {
+      return { ok: false, normalizedWord, reason: 'no-template' };
+    }
+
+    // The invariant the whole lookup exists to hold. It cannot fail through
+    // `resolveTemplate` — both halves come from the one call — but it is the
+    // thing that went wrong, so it is asserted rather than assumed.
+    if (templateKey !== normalizedWord && !isAliasOf(templateKey, normalizedWord)) {
+      return { ok: false, normalizedWord, reason: 'key-mismatch' };
+    }
+
+    const template = strokesFor(templateKey);
+    if (template.length === 0 || template.some((stroke) => stroke.points.length === 0)) {
+      return { ok: false, normalizedWord, reason: 'empty-template' };
+    }
+    if (!template.every((stroke) => stroke.points.every(isUnitPoint))) {
+      return { ok: false, normalizedWord, reason: 'invalid-points' };
+    }
 
     const behaviour = BOT_BEHAVIOUR[difficulty];
-    const { strokes: template, matched } = templateFor(normalizeGuess(word));
 
     // How much of the template this difficulty bothers with. Always at least
     // one stroke: a bot that drew nothing would be a blank canvas nobody can
@@ -153,30 +218,32 @@ export class BotDrawerService {
       steps.push({ kind: 'end', delayMs: 0, strokeId });
     }
 
-    logger.debug('bot drawing planned', {
-      strokes: chosen.length,
-      packets: packetCount,
-      intervalMs,
-      matchedTemplate: matched,
-    });
-
-    return { steps, matchedTemplate: matched, totalMs };
+    return {
+      ok: true,
+      steps,
+      normalizedWord,
+      templateKey,
+      strokeCount: chosen.length,
+      drawingSessionId: drawingSessionId(session, normalizedWord),
+      totalMs,
+    };
   }
 
   /**
    * Which of the offered words a bot drawer takes.
    *
    * Prefers one it has a template for, which is the honest version of a player
-   * picking the word they can draw. Falling back to a random index rather than
-   * always the first keeps two bots offered the same three words from
-   * consistently choosing the same one.
+   * picking the word they can draw — and which is now the main thing keeping
+   * bots drawing at all, since a word with no template is a turn the bot sits
+   * out. Falling back to a random index rather than always the first keeps two
+   * bots offered the same three words from consistently choosing the same one.
    */
   chooseWordIndex(choices: readonly { text: string }[]): number {
     if (choices.length === 0) return 0;
 
     const drawable: number[] = [];
     choices.forEach((choice, index) => {
-      if (templateFor(normalizeGuess(choice.text)).matched) drawable.push(index);
+      if (hasTemplate(choice.text)) drawable.push(index);
     });
 
     if (drawable.length > 0) {
@@ -184,6 +251,35 @@ export class BotDrawerService {
     }
     return randomBelow(choices.length);
   }
+}
+
+/**
+ * The key a plan is bound to.
+ *
+ * ## Why this never goes on the wire
+ *
+ * It contains the answer. Its whole job is to let this process recognise its
+ * own stale work — a timer from the previous round, a second plan for a turn
+ * already being drawn — and that is a server-side question with a server-side
+ * answer. Putting it in a `s:draw:*` payload would hand the word to every
+ * guesser in the room, which is the one thing the engine may never do, so the
+ * wire protocol is unchanged and drawing packets are authorised the way they
+ * always were: against `round.drawerId`, by `drawingService.assertCanDraw`.
+ *
+ * It is logged only in development, where the log already prints the word.
+ */
+export function drawingSessionId(session: DrawSession, normalizedWord: string): string {
+  return `${session.gameId}:${session.roundId}:${session.botId}:${normalizedWord}`;
+}
+
+/** Whether a normalised word reaches this key through the alias table. */
+function isAliasOf(templateKey: string, normalizedWord: string): boolean {
+  return resolveTemplate(normalizedWord).templateKey === templateKey;
+}
+
+/** A finite coordinate inside the unit square, pressure included. */
+function isUnitPoint(point: PointTuple): boolean {
+  return point.every((value) => Number.isFinite(value) && value >= 0 && value <= 1);
 }
 
 /** Splits a point list into batches of at most `size`. */

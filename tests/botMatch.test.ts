@@ -446,17 +446,107 @@ describe('cleaning up', () => {
 
     // A drawing turn broadcasts several times — a hint landing, a guesser
     // scoring. Each one reaches `reconcile`, and a restart on any of them
-    // would wipe the board and start the picture again.
+    // would draw the picture a second time on top of the first.
     botPlayerService.reconcile(room);
     vi.advanceTimersByTime(3_000);
 
-    const afterFirst = room.board.strokes.length;
+    const finished = room.board.strokes.length;
+    expect(finished).toBeGreaterThan(0);
 
     botPlayerService.reconcile(room);
     botPlayerService.reconcile(room);
-    vi.advanceTimersByTime(1);
 
-    expect(room.board.strokes.length).toBe(afterFirst);
-    expect(botPlayerService.activeWorkers()).toBe(1);
+    // Long enough for a whole second copy of the drawing to have landed, which
+    // is what used to happen: this bot's plan had already run to the end, so
+    // there was no live task for the "already drawing?" check to find, and the
+    // next broadcast planned the same turn again. The session key is what now
+    // recognises it. Ninety seconds is past the pacing budget for the turn.
+    vi.advanceTimersByTime(90_000);
+
+    expect(room.board.strokes.length).toBe(finished);
+    expect(botPlayerService.activeWorkers()).toBe(0);
+  });
+
+  it('does not redraw a finished picture even after the drawer is re-announced', () => {
+    const room = roomWithBot({ phase: GAME_PHASE.drawing });
+    room.round = makeRound({
+      drawerId: BOT,
+      word: 'lion',
+      turnStartMs: Date.now(),
+      turnEndMs: Date.now() + 120_000,
+    });
+
+    botPlayerService.bindEngine(stubEngine(room));
+    botPlayerService.reconcile(room);
+    vi.advanceTimersByTime(120_000);
+
+    const finished = room.board.strokes.length;
+    expect(finished).toBeGreaterThan(0);
+
+    // A reconnect mid-turn: the room re-broadcasts, the bot is still the
+    // drawer, and the word has not changed.
+    botPlayerService.reconcile(room);
+    vi.advanceTimersByTime(120_000);
+
+    expect(room.board.strokes.length).toBe(finished);
+  });
+
+  it('sits out a word it has no template for, rather than drawing another one', () => {
+    const room = roomWithBot({ phase: GAME_PHASE.drawing });
+    room.round = makeRound({
+      drawerId: BOT,
+      // Real, in the bank, and not something this library can draw.
+      word: 'orchestra conductor',
+      turnStartMs: Date.now(),
+      turnEndMs: Date.now() + 120_000,
+    });
+
+    botPlayerService.bindEngine(stubEngine(room));
+    botPlayerService.reconcile(room);
+    vi.advanceTimersByTime(120_000);
+
+    // Nothing at all — not a generic face, which is what used to appear here
+    // and what sent every guesser in the room down the same wrong path.
+    expect(room.board.strokes).toHaveLength(0);
+    expect(botPlayerService.activeWorkers()).toBe(0);
+  });
+
+  it('draws the round’s own word, not the previous round’s', () => {
+    const room = roomWithBot({ phase: GAME_PHASE.drawing });
+    room.round = makeRound({
+      drawerId: BOT,
+      word: 'lion',
+      turnStartMs: Date.now(),
+      turnEndMs: Date.now() + 120_000,
+    });
+
+    botPlayerService.bindEngine(stubEngine(room));
+    botPlayerService.reconcile(room);
+    vi.advanceTimersByTime(120_000);
+
+    const lion = room.board.strokes.map((entry) => entry.p.length).join(',');
+    expect(lion.length).toBeGreaterThan(0);
+
+    // The turn ends and a new one opens with a different word, exactly as the
+    // engine does it: a fresh round id and a fresh board.
+    room.round.ended = true;
+    botPlayerService.reconcile(room);
+
+    room.board = { strokes: [], redoStack: [] };
+    room.round = makeRound({
+      roundId: 'round-2',
+      drawerId: BOT,
+      word: 'fish',
+      turnStartMs: Date.now(),
+      turnEndMs: Date.now() + 120_000,
+    });
+
+    botPlayerService.reconcile(room);
+    vi.advanceTimersByTime(120_000);
+
+    const fish = room.board.strokes.map((entry) => entry.p.length).join(',');
+
+    expect(fish.length).toBeGreaterThan(0);
+    expect(fish).not.toBe(lion);
   });
 });

@@ -2,7 +2,7 @@ import {
   BOT_BEHAVIOUR,
   type BotDifficultyWire,
 } from '@/constants/autoTournament.constants';
-import { templateFor, TEMPLATE_WORDS, type TemplateStroke } from '@/services/bot/drawingTemplates';
+import { strokesFor, TEMPLATE_KEYS, type TemplateStroke } from '@/services/bot/drawingTemplates';
 import type { PointTuple, StrokeDto } from '@/types/drawing.types';
 import { normalizeGuess } from '@/utils/normalizeGuess';
 import { randomBelow, shuffled } from '@/utils/random';
@@ -147,8 +147,10 @@ function ensureTemplateProfiles(): Map<string, BoardProfile> {
   if (templateProfiles) return templateProfiles;
 
   templateProfiles = new Map();
-  for (const word of TEMPLATE_WORDS) {
-    templateProfiles.set(word, profileOfTemplate(templateFor(word).strokes));
+  // Canonical keys only. Aliases resolve to the same drawing, so profiling
+  // them too would weight a word more heavily for having more names.
+  for (const key of TEMPLATE_KEYS) {
+    templateProfiles.set(key, profileOfTemplate(strokesFor(key)));
   }
   return templateProfiles;
 }
