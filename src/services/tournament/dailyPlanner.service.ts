@@ -93,6 +93,34 @@ function indexNameOf(error: unknown): string | null {
   return /index: (\S+)/.exec(message)?.[1] ?? null;
 }
 
+/**
+ * How often the same misconfiguration is allowed to be logged.
+ *
+ * The scheduler ticks every few seconds and retries every unfilled slot, so an
+ * index mismatch is not one error — it is four an hour times nine hundred. At
+ * that rate the line stops being a diagnosis and becomes the thing burying
+ * every other diagnosis, which is the failure mode the *previous* log had.
+ * Loud once, then hourly, keeps it impossible to miss and impossible to drown
+ * in.
+ */
+const MISCONFIGURATION_LOG_INTERVAL_MS = 60 * 60 * 1000;
+
+/** When each index was last complained about. */
+const lastReportedAt = new Map<string, number>();
+
+/** Whether this misconfiguration is due to be logged again. */
+function shouldReport(index: string): boolean {
+  const now = Date.now();
+  const previous = lastReportedAt.get(index);
+
+  if (previous !== undefined && now - previous < MISCONFIGURATION_LOG_INTERVAL_MS) {
+    return false;
+  }
+
+  lastReportedAt.set(index, now);
+  return true;
+}
+
 export class TournamentDailyPlanner {
   /** How many tournaments exist on one day. Three, and not configurable. */
   get perDay(): number {
@@ -372,16 +400,22 @@ export class TournamentDailyPlanner {
         return null;
       }
 
-      logger.error('a daily tournament was refused by an unexpected unique index', {
-        tournamentDate,
-        dailySlot,
-        index: violated,
-        expectedIndex: SLOT_INDEX,
-        hint:
-          'the database holds a unique index this schema does not declare, so no ' +
-          'automatic tournament can be created. Run `npm run sync-indexes` against ' +
-          'this database to drop the stale indexes and build the current ones.',
-      });
+      // Throttled per index, not per slot: this is one misconfiguration, and
+      // the scheduler will rediscover it on every tick for every unfilled slot
+      // until somebody fixes the database. See the note on the interval.
+      if (shouldReport(violated)) {
+        logger.error('a daily tournament was refused by an unexpected unique index', {
+          tournamentDate,
+          dailySlot,
+          index: violated,
+          expectedIndex: SLOT_INDEX,
+          hint:
+            'the database holds a unique index this schema does not declare, so no ' +
+            'automatic tournament can be created. Run `npm run sync-indexes` against ' +
+            'this database to drop the stale indexes and build the current ones.',
+          note: 'further occurrences of this index are suppressed for an hour',
+        });
+      }
       return null;
     }
   }
