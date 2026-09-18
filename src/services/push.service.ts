@@ -64,9 +64,27 @@ export interface PushResult {
   pruned: number;
   /** True when there was nothing to send to. */
   noRecipients: boolean;
+  /**
+   * True when nothing was even attempted, because no service account is
+   * configured.
+   *
+   * Told apart from [noRecipients] deliberately. Both used to report the same
+   * `noRecipients: true`, which pointed every investigation at the wrong half
+   * of the system: "this player has never registered a handset" is a client
+   * problem, and "this deployment cannot send at all" is a missing environment
+   * variable, and the log line whose whole job is to answer "why did nothing
+   * arrive" could not distinguish them.
+   */
+  notConfigured: boolean;
 }
 
-const EMPTY: PushResult = { sent: 0, failed: 0, pruned: 0, noRecipients: true };
+const EMPTY: PushResult = {
+  sent: 0,
+  failed: 0,
+  pruned: 0,
+  noRecipients: true,
+  notConfigured: false,
+};
 
 /**
  * The FCM error codes that mean "this device is gone for good".
@@ -131,7 +149,7 @@ export class PushService {
    */
   async sendToDeviceToken(token: string, payload: PushPayload): Promise<PushResult> {
     const messaging = getPushMessaging();
-    if (!messaging) return { ...EMPTY };
+    if (!messaging) return { ...EMPTY, notConfigured: true };
 
     const message: Message = {
       token,
@@ -143,7 +161,7 @@ export class PushService {
     try {
       await this.withOneRetry(() => messaging.send(message));
       await deviceTokenRepository.touch([token]);
-      return { sent: 1, failed: 0, pruned: 0, noRecipients: false };
+      return { sent: 1, failed: 0, pruned: 0, noRecipients: false, notConfigured: false };
     } catch (error) {
       const code = (error as { code?: string }).code;
       const pruned = DEAD_TOKEN_CODES.has(code ?? '')
@@ -156,7 +174,7 @@ export class PushService {
         pruned,
       });
 
-      return { sent: 0, failed: 1, pruned, noRecipients: false };
+      return { sent: 0, failed: 1, pruned, noRecipients: false, notConfigured: false };
     }
   }
 
@@ -182,8 +200,11 @@ export class PushService {
       logger.warn('[FCM] push requested but firebase is not configured', {
         recipients: recipients.length,
         type: payload.data.type ?? 'unknown',
+        hint:
+          'set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY ' +
+          'on this deployment; until then every push is a logged no-op',
       });
-      return { ...EMPTY };
+      return { ...EMPTY, notConfigured: true };
     }
 
     const devices = await deviceTokenRepository.activeForUsers(recipients);
@@ -197,7 +218,7 @@ export class PushService {
       return { ...EMPTY };
     }
 
-    const result: PushResult = { sent: 0, failed: 0, pruned: 0, noRecipients: false };
+    const result: PushResult = { sent: 0, failed: 0, pruned: 0, noRecipients: false, notConfigured: false };
     const dead: string[] = [];
     const delivered: string[] = [];
 

@@ -1,9 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { NOTIFICATION_LIMITS, NOTIFICATION_TYPE } from '@/constants/notification.constants';
+import {
+  NOTIFICATION_LIMITS,
+  NOTIFICATION_TYPE,
+  PUSH_INVITE_ANDROID_CHANNEL,
+  PUSH_NOTIFICATION_TYPE,
+} from '@/constants/notification.constants';
 import { notificationRepository } from '@/repositories/notification.repository';
 import { userRepository } from '@/repositories/user.repository';
 import { notificationPaging, notificationService } from '@/services/notification.service';
+import { pushService } from '@/services/push.service';
 import { AppError, ErrorCode } from '@/utils/errors';
 import { notificationQuerySchema } from '@/validators/notification.validator';
 
@@ -286,5 +292,82 @@ describe('paging and query parsing', () => {
     const parsed = notificationQuerySchema.parse({});
     expect(parsed.page).toBe(1);
     expect(parsed.limit).toBe(NOTIFICATION_LIMITS.defaultLimit);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The push half
+// ---------------------------------------------------------------------------
+
+describe('delivering a notification as a push', () => {
+  /** Puts a stub behind the write so only the push decision is under test. */
+  function stubWrite(): void {
+    vi.spyOn(notificationRepository, 'create').mockResolvedValue(makeRow() as never);
+    vi.spyOn(notificationRepository, 'unreadCount').mockResolvedValue(1);
+    vi.spyOn(userRepository, 'findManyByIds').mockResolvedValue([] as never);
+  }
+
+  it('sends nothing when the caller did not ask for a push', async () => {
+    stubWrite();
+    const send = vi.spyOn(pushService, 'sendToUser');
+
+    await notificationService.notify({
+      userId: USER_A,
+      type: NOTIFICATION_TYPE.friendRequest,
+      title: 'New friend request',
+      body: 'Bo wants to be your friend.',
+    });
+
+    // Push is opt-in per call site. Adding a notification type must never
+    // silently start interrupting people whose phone is in their pocket.
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('sends the row own title and body, so the two cannot disagree', async () => {
+    stubWrite();
+    const send = vi
+      .spyOn(pushService, 'sendToUser')
+      .mockResolvedValue({ sent: 1, failed: 0, pruned: 0, noRecipients: false, notConfigured: false });
+
+    await notificationService.notify({
+      userId: USER_A,
+      type: NOTIFICATION_TYPE.roomInvitation,
+      title: 'Room invitation',
+      body: 'Ana invited you to room A7K9P.',
+      push: {
+        type: PUSH_NOTIFICATION_TYPE.roomInvitation,
+        androidChannelId: PUSH_INVITE_ANDROID_CHANNEL.id,
+        data: { invitationId: 'inv-1', roomCode: 'A7K9P' },
+      },
+    });
+
+    expect(send).toHaveBeenCalledWith(USER_A, {
+      title: 'Room invitation',
+      body: 'Ana invited you to room A7K9P.',
+      data: {
+        type: PUSH_NOTIFICATION_TYPE.roomInvitation,
+        invitationId: 'inv-1',
+        roomCode: 'A7K9P',
+      },
+      androidChannelId: PUSH_INVITE_ANDROID_CHANNEL.id,
+    });
+  });
+
+  it('still returns the row when the push itself fails', async () => {
+    stubWrite();
+    vi.spyOn(pushService, 'sendToUser').mockRejectedValue(new Error('FCM is down'));
+
+    const dto = await notificationService.notify({
+      userId: USER_A,
+      type: NOTIFICATION_TYPE.roomInvitation,
+      title: 'Room invitation',
+      body: 'Ana invited you to room A7K9P.',
+      push: { type: PUSH_NOTIFICATION_TYPE.roomInvitation },
+    });
+
+    // The inbox row is the durable half and does not depend on the nudge
+    // landing. A caller — an invite that has already been written to Mongo —
+    // must never be failed by a notification it did not wait for.
+    expect(dto).not.toBeNull();
   });
 });

@@ -77,7 +77,7 @@ export const roomController = {
     // "the room is full" has to be refused here as well or the REST path would
     // be the way around a rule the socket path enforces.
     invitationService.assertRoomAcceptsJoins(room, user.id);
-    invitationService.assertNotSeatedElsewhere(user.id, room.roomId);
+    await invitationService.assertNotSeatedElsewhere(user.id, room.roomId);
 
     const { rejoined } = await roomService.joinRoom({ room, user });
 
@@ -439,7 +439,7 @@ export const roomController = {
     if (!room) throw errors.roomNotFound();
 
     invitationService.assertRoomAcceptsJoins(room, user.id);
-    invitationService.assertNotSeatedElsewhere(user.id, room.roomId);
+    await invitationService.assertNotSeatedElsewhere(user.id, room.roomId);
 
     const { rejoined } = await roomService.joinRoom({ room, user });
 

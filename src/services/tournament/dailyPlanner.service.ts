@@ -71,6 +71,28 @@ export interface SlotSchedule {
   botFillAt: Date;
 }
 
+/**
+ * The one index a duplicate key on this insert is allowed to come from.
+ *
+ * Named here rather than read from the model so that renaming the index
+ * without updating this constant produces a loud, accurate error rather than a
+ * silent reclassification — which is the exact failure this guards against.
+ * It must match the `name` given to the unique index in `AutoTournament.ts`.
+ */
+const SLOT_INDEX = 'one_tournament_per_slot_per_day';
+
+/**
+ * The index named by a Mongo duplicate-key error, or null when it did not say.
+ *
+ * The driver reports it in `keyPattern`/`message` rather than as a field, so
+ * this reads whichever is present and never throws on a shape it does not
+ * recognise: a diagnostic that can fail is worse than one that says "unknown".
+ */
+function indexNameOf(error: unknown): string | null {
+  const message = (error as { message?: string }).message ?? '';
+  return /index: (\S+)/.exec(message)?.[1] ?? null;
+}
+
 export class TournamentDailyPlanner {
   /** How many tournaments exist on one day. Three, and not configurable. */
   get perDay(): number {
@@ -324,12 +346,41 @@ export class TournamentDailyPlanner {
     } catch (error) {
       if ((error as { code?: number }).code !== 11000) throw error;
 
-      // Somebody else created it. Not an error — it is the constraint doing
-      // exactly what it is there for, and the reason there is no read-modify-
-      // write anywhere in this file.
-      logger.info('a daily tournament slot was created concurrently', {
+      // A duplicate key is only benign when it came from the index that is
+      // *supposed* to reject a second attempt at this slot. Any other unique
+      // index rejecting this insert means the database is enforcing a rule the
+      // schema no longer declares, and no tournament will ever be created
+      // again until somebody reconciles them.
+      //
+      // Telling the two apart is not pedantry. Reported as one benign line,
+      // the second case is invisible: the scheduler retries every tick, every
+      // retry logs "created concurrently", and a system that has silently
+      // stopped producing tournaments looks exactly like one that is racing
+      // with itself. That is precisely how a stale `tournamentNumber_1` — a
+      // unique index on a field this schema stopped writing, so every new row
+      // collides on `null` — went unnoticed while it broke the feature
+      // outright.
+      const violated = indexNameOf(error);
+
+      if (violated === null || violated === SLOT_INDEX) {
+        // The constraint doing exactly what it is there for, and the reason
+        // there is no read-modify-write anywhere in this file.
+        logger.info('a daily tournament slot was created concurrently', {
+          tournamentDate,
+          dailySlot,
+        });
+        return null;
+      }
+
+      logger.error('a daily tournament was refused by an unexpected unique index', {
         tournamentDate,
         dailySlot,
+        index: violated,
+        expectedIndex: SLOT_INDEX,
+        hint:
+          'the database holds a unique index this schema does not declare, so no ' +
+          'automatic tournament can be created. Run `npm run sync-indexes` against ' +
+          'this database to drop the stale indexes and build the current ones.',
       });
       return null;
     }

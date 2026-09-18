@@ -172,7 +172,21 @@ async function main(): Promise<void> {
   const health = (await (await fetch(`${API}/api/health`)).json()) as Record<string, unknown>;
   check('server is healthy', health.status === 'healthy', health);
   check('database is connected', health.database === 'connected', health);
-  check('socket server is attached', health.socket === 'attached', health);
+  // `socket` used to be the string 'attached'. It is now an object, because
+  // the REST deployment has to describe a realtime server it may not be
+  // hosting — `{ mode: 'attached' | 'external' | 'detached', status, ... }`.
+  // The string comparison this replaces failed against a perfectly healthy
+  // server, which is worse than no check: a suite that cries wolf stops being
+  // read. Both shapes are accepted so this script still works against an older
+  // deployment.
+  const socket = health.socket;
+  const attached =
+    socket === 'attached' ||
+    (typeof socket === 'object' &&
+      socket !== null &&
+      (socket as { mode?: string }).mode === 'attached');
+
+  check('socket server is attached', attached, health);
 
   section('guest login and connect');
   const alice = await connect('Alice');

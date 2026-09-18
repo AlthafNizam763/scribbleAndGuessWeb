@@ -2,6 +2,7 @@ import { emitToUser } from '@/config/socket';
 import {
   NOTIFICATION_LIMITS,
   type NotificationTypeWire,
+  type PushNotificationTypeWire,
 } from '@/constants/notification.constants';
 import { PAGE_LIMITS } from '@/constants/social.constants';
 import { NOTIFICATION_EVENTS, type NotificationEventName } from '@/constants/socket.constants';
@@ -9,6 +10,7 @@ import type { NotificationDocument } from '@/models/Notification';
 import { notificationRepository } from '@/repositories/notification.repository';
 import { userRepository } from '@/repositories/user.repository';
 import { toUserSummary } from '@/services/profile.serialize';
+import { pushService } from '@/services/push.service';
 import type { NotificationDto, NotificationPageDto } from '@/types/notification.types';
 import type { UserSummaryDto } from '@/types/social.types';
 import { AppError, ErrorCode } from '@/utils/errors';
@@ -69,6 +71,24 @@ export interface NotifyInput {
   body: string;
   actorId?: string | null;
   data?: Record<string, unknown>;
+  /**
+   * Also deliver this as an FCM push, for a recipient whose app is not running.
+   *
+   * Opt-in per call site rather than derived from `type`, so adding a
+   * notification type never silently starts interrupting people — see the note
+   * on `PUSH_NOTIFICATION_TYPE` for what earns a place here.
+   *
+   * The push carries the row's own `title` and `body`, so the two can never
+   * say different things, and `data` is a *separate*, string-only map: FCM
+   * rejects anything else in a data block, and the notification row's `data`
+   * is free-form. Nothing authoritative travels in it; the screen a tap opens
+   * re-reads the real state over REST.
+   */
+  push?: {
+    type: PushNotificationTypeWire;
+    data?: Record<string, string>;
+    androidChannelId?: string;
+  };
 }
 
 function toDto(
@@ -139,6 +159,11 @@ export class NotificationService {
         unreadCount: await notificationRepository.unreadCount(input.userId),
       });
 
+      // The half that reaches a device with no socket on it. Deliberately not
+      // awaited and deliberately after the row: a push is best-effort and an
+      // FCM round trip must not sit in front of the action that caused it.
+      if (input.push) this.deliverPush(input);
+
       return dto;
     } catch (error) {
       logger.exception('notification write failed', error, {
@@ -147,6 +172,49 @@ export class NotificationService {
       });
       return null;
     }
+  }
+
+  /**
+   * Sends one notification's push half, and swallows every failure.
+   *
+   * Separate from [notify] so the outcome can be logged with the delivery
+   * counts that actually answer "did it arrive": a `sent` of zero with
+   * `noRecipients` true means the recipient has never registered a device,
+   * which is a completely different problem from a rejected token — and
+   * neither is visible in the 200 the inviter's request returns. That
+   * distinction is why the log line below exists at all.
+   */
+  private deliverPush(input: NotifyInput): void {
+    const wanted = input.push;
+    if (!wanted) return;
+
+    void pushService
+      .sendToUser(input.userId, {
+        title: input.title,
+        body: input.body,
+        data: { type: wanted.type, ...(wanted.data ?? {}) },
+        androidChannelId: wanted.androidChannelId,
+      })
+      .then((outcome) => {
+        logger.info('[FCM] notification push delivered', {
+          userId: input.userId,
+          type: wanted.type,
+          sent: outcome.sent,
+          failed: outcome.failed,
+          pruned: outcome.pruned,
+          // The three ways nothing arrives, kept apart because they have three
+          // different fixes: no service account on the deployment, no handset
+          // ever registered by this player, or a token FCM rejected.
+          notConfigured: outcome.notConfigured,
+          noRecipients: outcome.noRecipients && !outcome.notConfigured,
+        });
+      })
+      .catch((error: unknown) => {
+        logger.exception('[FCM] notification push failed', error, {
+          userId: input.userId,
+          type: wanted.type,
+        });
+      });
   }
 
   /**

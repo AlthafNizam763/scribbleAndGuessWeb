@@ -666,10 +666,14 @@ describe('room membership rules', () => {
     expect(() => invitationService.assertRoomAcceptsJoins(room, HOST.id)).not.toThrow();
   });
 
-  it('refuses a player who already holds a seat in another room', async () => {
-    vi.spyOn(roomService, 'liveRoomOf').mockReturnValue(
-      makeRoom({ roomId: 'another-room' }),
-    );
+  it('refuses a player who is connected in another room right now', async () => {
+    // A live socket in the other room is somebody actually playing there, and
+    // the refusal is something they can act on: leave, then come back.
+    const elsewhere = makeRoom({
+      roomId: 'another-room',
+      players: [makePlayer({ userId: FRIEND.id, socketIds: new Set(['socket-1']) })],
+    });
+    vi.spyOn(roomService, 'liveRoomOf').mockReturnValue(elsewhere);
 
     expect(
       await messageOf(async () =>
@@ -678,13 +682,53 @@ describe('room membership rules', () => {
     ).toBe('You are already in another room. Leave that room first.');
   });
 
-  it('allows re-entering the room the player is already in', () => {
+  it('vacates an abandoned seat instead of refusing the join', async () => {
+    // The reported bug: the app was backgrounded or killed rather than left
+    // through the Leave button, so the seat stands for the length of the
+    // reconnect grace. Nobody is connected to it, so it is given up rather
+    // than used to refuse an invitation the player just accepted.
+    const elsewhere = makeRoom({
+      roomId: 'another-room',
+      players: [makePlayer({ userId: FRIEND.id, socketIds: new Set<string>() })],
+    });
+    vi.spyOn(roomService, 'liveRoomOf').mockReturnValue(elsewhere);
+
+    const remove = vi
+      .spyOn(roomService, 'removePlayer')
+      .mockResolvedValue({ roomEmpty: false });
+
+    await expect(
+      invitationService.assertNotSeatedElsewhere(FRIEND.id, OBJECT_ID_C),
+    ).resolves.toBeUndefined();
+
+    expect(remove).toHaveBeenCalledWith(elsewhere, FRIEND.id);
+  });
+
+  it('closes the room it vacated when that seat was the last one', async () => {
+    const elsewhere = makeRoom({
+      roomId: 'another-room',
+      players: [makePlayer({ userId: FRIEND.id, socketIds: new Set<string>() })],
+    });
+    vi.spyOn(roomService, 'liveRoomOf').mockReturnValue(elsewhere);
+    vi.spyOn(roomService, 'removePlayer').mockResolvedValue({ roomEmpty: true });
+    const close = vi.spyOn(roomService, 'close').mockResolvedValue();
+
+    await invitationService.assertNotSeatedElsewhere(FRIEND.id, OBJECT_ID_C);
+
+    expect(close).toHaveBeenCalledWith(elsewhere, 'last player left');
+  });
+
+  it('allows re-entering the room the player is already in', async () => {
     const room = lobbyRoom();
     vi.spyOn(roomService, 'liveRoomOf').mockReturnValue(room);
+    const remove = vi.spyOn(roomService, 'removePlayer');
 
-    expect(() =>
+    await expect(
       invitationService.assertNotSeatedElsewhere(HOST.id, room.roomId),
-    ).not.toThrow();
+    ).resolves.toBeUndefined();
+
+    // And emphatically does not vacate the seat it is about to re-enter.
+    expect(remove).not.toHaveBeenCalled();
   });
 });
 

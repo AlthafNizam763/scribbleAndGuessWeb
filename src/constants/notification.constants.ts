@@ -140,9 +140,22 @@ export const DEVICE_TOKEN_LIMITS = {
  * deadline attached — a player who misses it loses their place — which is the
  * only justification for interrupting somebody whose phone is in their pocket.
  * Everything else in `NOTIFICATION_TYPE` stays in the inbox.
+ *
+ * ## Why a room invitation is on this list
+ *
+ * Because it has the same shape as a check-in: it expires (`TIMING.
+ * invitationTtlMs`), and the person it is addressed to is by construction not
+ * looking at the app — a friend invites somebody precisely *because* they are
+ * not already in the room. The socket cannot reach them: the client opens a
+ * connection when it enters a room and at no other time, so an invitation
+ * delivered only over `s:room:invitationReceived` reaches a player who is
+ * already playing and nobody else. That is the whole of the "my friend never
+ * got the invite" report — it was never a delivery failure, there was no
+ * delivery path at all for an idle app.
  */
 export const PUSH_NOTIFICATION_TYPE = {
   tournamentCheckInOpen: 'TOURNAMENT_CHECKIN_OPEN',
+  roomInvitation: 'ROOM_INVITATION',
 } as const;
 
 export type PushNotificationTypeWire =
@@ -194,6 +207,21 @@ export function notificationKeyFor(
 export const PUSH_ANDROID_CHANNEL = {
   id: 'tournament_notifications',
   name: 'Tournament Notifications',
+} as const;
+
+/**
+ * The channel room invitations are delivered on.
+ *
+ * Its own channel rather than the tournament one, because an Android channel
+ * is the unit a player mutes: somebody who does not play tournaments should be
+ * able to silence those without also silencing a friend asking them to play.
+ * Same importance — an invitation expires, so it has to raise a heads-up
+ * banner rather than sit silently in the shade — and the same contract as
+ * above: the Flutter client creates a channel with this exact id at startup.
+ */
+export const PUSH_INVITE_ANDROID_CHANNEL = {
+  id: 'room_invitations',
+  name: 'Room Invitations',
 } as const;
 
 /**

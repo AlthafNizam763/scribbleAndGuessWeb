@@ -1,5 +1,9 @@
 import { TIMING } from '@/constants/game.constants';
-import { NOTIFICATION_TYPE } from '@/constants/notification.constants';
+import {
+  NOTIFICATION_TYPE,
+  PUSH_INVITE_ANDROID_CHANNEL,
+  PUSH_NOTIFICATION_TYPE,
+} from '@/constants/notification.constants';
 import {
   GAME_PHASE,
   INVITATION_STATUS,
@@ -236,6 +240,27 @@ export class InvitationService {
         roomCode: room.code,
         expiresAtMs: expiresAt.getTime(),
       },
+      // And as a push, which is the only thing that reaches the invitee's
+      // handset at all: the socket event above lands on a connection, and a
+      // player who is not already in a room does not have one. See the note on
+      // `PUSH_NOTIFICATION_TYPE.roomInvitation`.
+      //
+      // The payload is ids only. It is enough for the client to open the
+      // invitation inbox and re-read it over REST, and it deliberately does
+      // not let a tap accept anything — the accept re-checks every room rule
+      // at the moment of the tap, which a payload cannot.
+      push: {
+        type: PUSH_NOTIFICATION_TYPE.roomInvitation,
+        androidChannelId: PUSH_INVITE_ANDROID_CHANNEL.id,
+        data: {
+          invitationId: dto.id,
+          roomCode: room.code,
+          // Matched by the Flutter router's own path constant, like the
+          // check-in push's `/tournaments`. Advisory: the client decides where
+          // a kind it recognises goes.
+          route: '/rooms/invitations',
+        },
+      },
     });
 
     logger.info('room invitation sent', {
@@ -284,7 +309,7 @@ export class InvitationService {
     }
 
     this.assertRoomAcceptsJoins(room, user.id);
-    this.assertNotSeatedElsewhere(user.id, room.roomId);
+    await this.assertNotSeatedElsewhere(user.id, room.roomId);
 
     // Flip the row first. It is the one with the concurrency guard on it, so
     // losing this step means another tap already answered the invitation and
@@ -601,20 +626,67 @@ export class InvitationService {
   }
 
   /**
-   * Refuses a join when this player already holds a seat somewhere else.
+   * Makes sure this player holds no seat anywhere but [targetRoomId].
    *
-   * The brief's rule, in its exact wording. A player in two rooms would be
+   * The brief's "one room at a time" rule. A player in two rooms would be
    * drawing in one while guessing in the other, and the server is the only
-   * thing that can see both. Leaving is always allowed, so this is a refusal
-   * the player can act on rather than a dead end.
+   * thing that can see both.
+   *
+   * ## Why an abandoned seat is vacated rather than refused
+   *
+   * This used to throw whenever `liveRoomOf` found anything, which made the
+   * rule depend on something the player cannot see or act on. A seat outlives
+   * the connection that took it by `TIMING.reconnectGraceMs` — that is the
+   * whole point of the grace period, and it is what lets a tunnel or a wifi
+   * handover cost nobody their match. But it also means every ordinary way of
+   * leaving a room *without* pressing Leave — the app swiped away, the phone
+   * backgrounded long enough for the socket to drop, a crash, MIUI killing the
+   * process — leaves a seat standing for another forty-five seconds.
+   *
+   * During that window this refused the player's next invitation with "You are
+   * already in another room. Leave that room first.", naming a room they had
+   * already left and offering nothing they could do about it. Waiting out the
+   * grace made it work, which is exactly the reported "they have to try again
+   * before the room opens".
+   *
+   * The socket join path never had this problem, because `leaveCurrentRoom` in
+   * `room.socket.ts` *vacates* the old seat instead of refusing. So the two
+   * transports disagreed about what "already in a room" meant, and the Flutter
+   * client happened to use the one that refused. This makes them agree.
+   *
+   * The distinction that matters is not "is there a seat" but "is anybody
+   * sitting in it": a player with a live socket in another room is genuinely
+   * playing somewhere else and is still refused, with a message they can act
+   * on. A seat with no connection behind it is an artefact of the grace
+   * period, and giving it up is what the player was trying to do anyway.
    */
-  assertNotSeatedElsewhere(userId: string, targetRoomId: string): void {
+  async assertNotSeatedElsewhere(userId: string, targetRoomId: string): Promise<void> {
     const current = roomService.liveRoomOf(userId);
     if (!current || current.roomId === targetRoomId) return;
 
-    throw errors.invalidAction(
-      'You are already in another room. Leave that room first.',
-    );
+    const seat = current.players.get(userId);
+
+    // Somebody is actually playing in there, on at least one device. This is
+    // the case the rule exists for, and the refusal is honest and actionable.
+    if (seat && seat.socketIds.size > 0) {
+      throw errors.invalidAction(
+        'You are already in another room. Leave that room first.',
+      );
+    }
+
+    // An abandoned seat. Vacated exactly the way a departure is, so the room
+    // that held it gets the same host succession, the same `playerLeft`
+    // broadcast and the same close-when-empty it would have got had the player
+    // pressed Leave.
+    const { roomEmpty } = await roomService.removePlayer(current, userId);
+    if (roomEmpty) await roomService.close(current, 'last player left');
+
+    logger.info('vacated an abandoned seat before a join', {
+      userId,
+      fromRoomId: current.roomId,
+      toRoomId: targetRoomId,
+      roomClosed: roomEmpty,
+    });
   }
 
   /** Loads an invitation, refusing anything that is not still answerable. */
