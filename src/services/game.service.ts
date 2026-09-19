@@ -1145,6 +1145,16 @@ export class GameService {
      */
     const humanStandings = standings.filter((entry) => !room.players.get(entry.playerId)?.isBot);
 
+    /**
+     * Whether this match had any Stupids in it.
+     *
+     * Read from the seats rather than from the standings, because a bot that
+     * left mid-match still made it a match played against the house — and
+     * computed once here rather than per player, since it is a fact about the
+     * room and every human in it shares the answer.
+     */
+    const playedWithBots = [...room.players.values()].some((player) => player.isBot);
+
     if (ranked) {
       // A tie means more than one winner, which is the honest reading of a
       // draw — nobody's record should say they lost.
@@ -1154,6 +1164,13 @@ export class GameService {
             scored: entry.score,
             won: entry.rank === 1,
             bestRoundScore: entry.score,
+            // What the profile's game breakdown is keyed by. This engine only
+            // ever runs Scribble & Guess; the platform engine passes its own.
+            gameId: 'SCRIBBLE_GUESS',
+            // Per room, not per bot: one Stupid or five, this was an evening
+            // played against the house, which is the distinction the profile
+            // line is actually making.
+            vsBots: playedWithBots,
           }),
         ),
       ).catch((error: unknown) => {

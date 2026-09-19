@@ -584,12 +584,24 @@ export const BOT_PROFILES: readonly {
   avatarId: number;
   avatarColorIndex: number;
 }[] = Object.freeze([
-  { botId: 'scribbler', displayName: 'Scribbler', avatarId: 3, avatarColorIndex: 0 },
-  { botId: 'sketcher', displayName: 'Sketcher', avatarId: 7, avatarColorIndex: 1 },
-  { botId: 'doodler', displayName: 'Doodler', avatarId: 11, avatarColorIndex: 2 },
-  { botId: 'guessmaster', displayName: 'GuessMaster', avatarId: 5, avatarColorIndex: 3 },
-  { botId: 'pixeler', displayName: 'Pixeler', avatarId: 14, avatarColorIndex: 4 },
-  { botId: 'quickdrawer', displayName: 'QuickDrawer', avatarId: 9, avatarColorIndex: 5 },
+  // The Stupids.
+  //
+  // `botId` is the stable key — a bracket stores it, and changing one would
+  // orphan the match that named it — so the keys below are the original six
+  // and stay as they are. The display names are the product's, and STUPID
+  // GAMES does not have "AI Player 3": it has a cast, each of whom is stupid
+  // in their own identifiable way, so a player recognises Mr Whiskers being an
+  // idiot again rather than noticing a bot.
+  { botId: 'scribbler', displayName: 'Mr Whiskers', avatarId: 3, avatarColorIndex: 0 },
+  { botId: 'sketcher', displayName: 'Sir Naps', avatarId: 7, avatarColorIndex: 1 },
+  { botId: 'doodler', displayName: 'Chaos Kitty', avatarId: 11, avatarColorIndex: 2 },
+  { botId: 'guessmaster', displayName: 'Professor Paws', avatarId: 5, avatarColorIndex: 3 },
+  { botId: 'pixeler', displayName: 'Lord Fluff', avatarId: 14, avatarColorIndex: 4 },
+  { botId: 'quickdrawer', displayName: 'Captain Zoom', avatarId: 9, avatarColorIndex: 5 },
+  { botId: 'smugcat', displayName: 'Smug Dave', avatarId: 6, avatarColorIndex: 6 },
+  { botId: 'confusedcat', displayName: 'Confused Gary', avatarId: 12, avatarColorIndex: 7 },
+  { botId: 'scaredcat', displayName: 'Nervous Nancy', avatarId: 10, avatarColorIndex: 1 },
+  { botId: 'lazycat', displayName: 'Big Yawn', avatarId: 8, avatarColorIndex: 3 },
 ]);
 
 /**
@@ -600,7 +612,15 @@ export const BOT_PROFILES: readonly {
  * so a client that renders what it is given is correct by default.
  */
 export const BOT_LABEL = {
-  emoji: '🤖',
-  /** Shown under the name. The difficulty is appended by the client. */
-  subtitle: 'AI Player',
+  emoji: '🐱',
+  /**
+   * Shown under the name. The difficulty is appended by the client.
+   *
+   * "Stupid", not "AI Player" or "Bot": on this platform the bots are branded
+   * characters, the feature is called PLAY WITH STUPID, and a badge reading
+   * "AI Player" beside a player called Smug Dave would be the one place the
+   * joke breaks. It is still unambiguous — nobody mistakes a Stupid for a
+   * person — which is the job a bot badge actually has.
+   */
+  subtitle: 'Stupid',
 } as const;

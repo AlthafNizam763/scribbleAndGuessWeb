@@ -22,6 +22,20 @@ export interface PlayerStatsDto {
   /** Wins as a percentage, to one decimal place. */
   winRate: number;
 
+  /** Matches finished in a room that had at least one Stupid in it. */
+  botGamesPlayed: number;
+  /** The rest. Derived, so the two always sum to `gamesPlayed`. */
+  onlineGamesPlayed: number;
+  /**
+   * Matches finished per game id, highest first.
+   *
+   * The multi-game profile's one genuinely new line: which of these somebody
+   * actually plays. Sent as an ordered array rather than a map so the client
+   * renders the server's ordering instead of inventing its own, and so a game
+   * this client has never heard of still appears with its id.
+   */
+  gamesByGameId: { gameId: string; played: number }[];
+
   // --- scoring -------------------------------------------------------------
   totalScore: number;
   /** The best single match score. */

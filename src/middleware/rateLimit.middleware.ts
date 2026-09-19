@@ -56,6 +56,25 @@ export interface RateLimitRule {
 export const RATE_LIMITS = {
   /** Account creation. Low, because each one writes a row. */
   guestLogin: { burst: 5, perSecond: 0.05 },
+  /**
+   * Registering an email account, or upgrading a guest to one.
+   *
+   * Matched to `guestLogin` rather than made stricter: registering is the same
+   * kind of act — one row written, or one guest row upgraded — and a household
+   * behind one address should still be able to sign up a few players in a
+   * sitting.
+   */
+  register: { burst: 5, perSecond: 0.05 },
+  /**
+   * Email sign-in attempts.
+   *
+   * Deliberately the tightest bucket in this table. Every other limit here
+   * protects a resource; this one protects a *password*. Five tries then one
+   * every thirty seconds makes an online guessing run useless without being
+   * noticeable to somebody who simply mistyped. Keyed by address, so one
+   * attacker cannot spend another account's budget by targeting it.
+   */
+  emailLogin: { burst: 5, perSecond: 0.033 },
   createRoom: { burst: 5, perSecond: 0.1 },
   joinRoom: { burst: 10, perSecond: 0.5 },
   /** Generous: guessing fast is the game. */
@@ -82,6 +101,21 @@ export const RATE_LIMITS = {
    * candidate that would have completed a call.
    */
   voiceSignal: { burst: 200, perSecond: 25 },
+  /**
+   * Walking around the *Meridian*.
+   *
+   * The loosest bucket in the table, and it has to be. A client sends a
+   * direction whenever the stick moves, which on a touch device is every
+   * animation frame while a thumb is down — call it twenty a second, with a
+   * burst when somebody spins on the spot. A limit that throttled this would
+   * not stop an attacker, who gains nothing from sending directions faster
+   * than the server ticks; it would make a real player stutter.
+   *
+   * The actual protection against a flood is elsewhere and is structural: a
+   * direction is clamped to a unit vector and applied at the next tick, so a
+   * thousand messages in a second move a player exactly as far as twenty do.
+   */
+  spaceMove: { burst: 300, perSecond: 40 },
   /**
    * Sending a friend request.
    *
@@ -110,6 +144,15 @@ export const RATE_LIMITS = {
    * a name, which is what the ten-token bucket is sized for.
    */
   userSearch: { burst: 10, perSecond: 2 },
+  /**
+   * Deleting an account.
+   *
+   * Tight because nothing legitimate calls it twice: a player deletes their
+   * account once, from one confirmation dialog, and the work behind it is a
+   * dozen collection-wide deletes. The refill is slow enough that a stuck
+   * retry loop stops being one.
+   */
+  deleteAccount: { burst: 2, perSecond: 0.01 },
   /**
    * Quick Play.
    *

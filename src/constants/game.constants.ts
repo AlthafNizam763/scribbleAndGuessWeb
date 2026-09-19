@@ -159,7 +159,30 @@ export const INPUT_LIMITS = {
   maxNameLength: 16,
   maxChatLength: 120,
   maxReportLength: 120,
-  avatarCount: 18,
+  /**
+   * How many characters a client may choose from: the ten cats.
+   *
+   * New writes are clamped to this, so every avatar chosen from now on names a
+   * cat. It is deliberately *not* what the stored column is bounded by — see
+   * `legacyAvatarCount`.
+   */
+  avatarCount: 10,
+
+  /**
+   * The widest avatar id any stored row may hold.
+   *
+   * Kept at the pre-cat catalogue's size on purpose. Accounts created before
+   * the rebrand hold ids up to 17, and `updateProfile` saves with
+   * `runValidators: true` — so narrowing the schema's `max` to the new
+   * catalogue would make every one of those accounts unable to change its own
+   * username until it happened to pick a new face.
+   *
+   * The client folds an out-of-range id onto a cat when it draws one, which is
+   * what makes a stored 14 render as a character rather than as nothing. So
+   * the column stays wide, new writes stay narrow, and no row needs migrating.
+   */
+  legacyAvatarCount: 18,
+
   avatarColorCount: 8,
   /** Hard cap on a board, so a griefer cannot exhaust server memory. */
   maxStrokesPerBoard: 4000,

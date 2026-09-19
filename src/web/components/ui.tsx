@@ -11,15 +11,21 @@ import type { ConnectionState, GameFailure } from '@/web/GameProvider';
  * length as the server's `avatarColorCount`.
  */
 
+/*
+ * The same eight accents, in the same order, as `AppColors.avatarPalette` in
+ * the Flutter client. The order is on the wire — an index is persisted with
+ * the profile and broadcast to every other player — so an entry may be
+ * recoloured but never moved, and the two clients must not disagree about it.
+ */
 const AVATAR_COLORS = [
-  '#6c8cff',
-  '#46d18a',
-  '#f2b545',
-  '#ff6b6b',
-  '#c084fc',
-  '#22d3ee',
-  '#fb923c',
-  '#f472b6',
+  '#ff5a5f',
+  '#4d8bff',
+  '#ffc53d',
+  '#2fd07b',
+  '#9b5cff',
+  '#ff8a3d',
+  '#ff5ca2',
+  '#00cfc1',
 ];
 
 /**

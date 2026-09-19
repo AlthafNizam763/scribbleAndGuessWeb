@@ -103,7 +103,15 @@ export const userRepository = {
    */
   async recordGameResult(
     id: string,
-    input: { scored: number; won: boolean; bestRoundScore: number },
+    input: {
+      scored: number;
+      won: boolean;
+      bestRoundScore: number;
+      /** Which game this match was, so the profile can say what they play. */
+      gameId?: string;
+      /** Whether the room contained at least one Stupid. */
+      vsBots?: boolean;
+    },
   ): Promise<void> {
     if (!isObjectId(id)) return;
     await User.updateOne(
@@ -113,6 +121,13 @@ export const userRepository = {
           gamesPlayed: 1,
           gamesWon: input.won ? 1 : 0,
           totalScore: Math.max(0, input.scored),
+          // A subset of `gamesPlayed`, never a parallel total — "online games"
+          // is the subtraction, so the two cannot drift apart.
+          botGamesPlayed: input.vsBots === true ? 1 : 0,
+          // Dot path into the map. Absent `gameId` writes nothing rather than
+          // creating an `undefined` key, which would then render as a game
+          // with no name on the profile.
+          ...(input.gameId ? { [`gamesByGameId.${input.gameId}`]: 1 } : {}),
         },
         $max: { bestRoundScore: Math.max(0, input.bestRoundScore) },
         $set: { lastSeenAt: new Date() },
@@ -124,6 +139,46 @@ export const userRepository = {
     // has just finished a match pull to refresh and see the standing they
     // changed.
     forgetWorldLeaderboard();
+  },
+
+  /**
+   * The preference subdocument for several accounts at once.
+   *
+   * One query rather than one per recipient, because the caller is the push
+   * fan-out: a tournament announcement names hundreds of people, and a read
+   * per person would turn one notification into hundreds of round trips.
+   *
+   * Selects nothing but the id and the switches — this runs on every push, and
+   * pulling whole user rows to read six booleans would be the most expensive
+   * thing in the path.
+   */
+  async findPreferences(ids: string[]): Promise<{ _id: Types.ObjectId; preferences?: unknown }[]> {
+    const valid = ids.filter(isObjectId);
+    if (valid.length === 0) return [];
+
+    return User.find({ _id: { $in: valid.map(toObjectId) } })
+      .select('preferences')
+      .lean()
+      .exec() as Promise<{ _id: Types.ObjectId; preferences?: unknown }[]>;
+  },
+
+  /**
+   * Writes preference switches by dot path.
+   *
+   * Takes an already-built `{'preferences.x': bool}` map rather than an object
+   * to spread, because that is the shape that leaves untouched switches alone
+   * — assigning `preferences` wholesale would silently reset the five a client
+   * did not mention. The caller builds it from a closed key list, so no
+   * arbitrary path can reach this query.
+   *
+   * Returns whether a row was found, so a caller can tell a no-op from a
+   * missing account.
+   */
+  async updatePreferences(id: string, update: Record<string, boolean>): Promise<boolean> {
+    if (!isObjectId(id)) return false;
+
+    const result = await User.updateOne({ _id: id }, { $set: update }).exec();
+    return result.matchedCount > 0;
   },
 
   /**
@@ -275,7 +330,19 @@ export const userRepository = {
   async searchByUsername(term: string, limit: number, excludeIds: string[] = []) {
     const pattern = new RegExp(`^${escapeRegex(term)}`, 'i');
 
-    const filter: Record<string, unknown> = { username: pattern };
+    const filter: Record<string, unknown> = {
+      username: pattern,
+      // A deleted account keeps a tombstone row, so "the row exists" no longer
+      // means "findable". Without this, every deletion would leave a "Deleted
+      // player" in the results for anybody typing "del".
+      deletedAt: null,
+      // An account that opted out of discovery is unsearchable by name. It is
+      // still reachable by a friend who already has it and still visible in a
+      // room it joined — this hides it from strangers, not from the people it
+      // is already playing with. `$ne: false` rather than `true`, so the rows
+      // that predate this preference are treated as opted in.
+      'preferences.discoverable': { $ne: false },
+    };
     if (excludeIds.length > 0) {
       filter._id = { $nin: excludeIds.filter(isObjectId).map(toObjectId) };
     }
@@ -327,7 +394,10 @@ const LEADERBOARD_FIELDS =
 
 /** Eligible for the world board, minus anyone the caller cannot see. */
 function rankedFilter(excludeIds: string[]): Record<string, unknown> {
-  const filter: Record<string, unknown> = { gamesPlayed: { $gt: 0 } };
+  // `deletedAt: null` for the same reason search carries it: a tombstone keeps
+  // the counters it was ranked by, so without this a deleted account would
+  // hold its place on the world board under a placeholder name.
+  const filter: Record<string, unknown> = { gamesPlayed: { $gt: 0 }, deletedAt: null };
   const valid = excludeIds.filter(isObjectId);
   if (valid.length > 0) filter._id = { $nin: valid.map(toObjectId) };
   return filter;

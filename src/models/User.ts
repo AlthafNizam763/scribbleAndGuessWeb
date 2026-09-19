@@ -35,7 +35,10 @@ const userSchema = new Schema(
      * image: the app draws avatars with a `CustomPainter`, so there is no asset
      * to store and nothing to serve.
      */
-    avatarId: { type: Number, required: true, default: 0, min: 0, max: INPUT_LIMITS.avatarCount - 1 },
+    // Bounded by the *legacy* count, not the current catalogue: rows created
+    // before the cats hold ids up to 17, and `updateProfile` validates on
+    // save. See `legacyAvatarCount`.
+    avatarId: { type: Number, required: true, default: 0, min: 0, max: INPUT_LIMITS.legacyAvatarCount - 1 },
     avatarColorIndex: {
       type: Number,
       required: true,
@@ -109,7 +112,69 @@ const userSchema = new Schema(
      */
     favoriteCategory: { type: String, trim: true, maxlength: 32, default: null },
 
+    /**
+     * What this player has asked to be sent, and what they let others see.
+     *
+     * ## Why these are on the account and not on the device
+     *
+     * Because the *server* acts on them. A "do not send me friend activity"
+     * toggle stored in the app is a toggle the push service never sees: the
+     * notification is composed and delivered while the app is closed, so a
+     * client-side filter would arrive a second too late, on a phone that has
+     * already buzzed. The same holds for visibility — whether a stranger can
+     * see you are online is decided when *their* request is served.
+     *
+     * Every one defaults to the permissive value, so an account created
+     * before this existed behaves exactly as it did.
+     *
+     * What is deliberately *not* here: sound, music, haptics, reduced motion,
+     * theme and language. Those are properties of a device, not of a person —
+     * somebody who mutes the game on a train has not asked for silence on
+     * their tablet — and they stay in the client's own settings store.
+     */
+    preferences: {
+      /** Push when somebody invites this player to a room. */
+      notifyGameInvites: { type: Boolean, default: true },
+      /** Push for friend requests and acceptances. */
+      notifyFriendActivity: { type: Boolean, default: true },
+      /** Push when a room this player is in starts, or needs them. */
+      notifyRoomActivity: { type: Boolean, default: true },
+      /** Announcements, maintenance notices and the like. */
+      notifySystem: { type: Boolean, default: true },
+
+      /** Whether anybody but a friend may see this player as online. */
+      showOnlineStatus: { type: Boolean, default: true },
+      /** Whether this player appears in username search. */
+      discoverable: { type: Boolean, default: true },
+    },
+
     lastSeenAt: { type: Date, default: Date.now },
+
+    /**
+     * When this account was deleted by its owner, or null while it lives.
+     *
+     * ## Why a tombstone and not a `deleteOne`
+     *
+     * Twenty-one collections reference a user id, and most of them are things
+     * *other people* are entitled to keep: the standings of a match they
+     * played, the chat in a room they were in, a bracket they won. Removing
+     * the row would leave every one of those pointing at nothing, and every
+     * screen that renders a name would render a blank where a person was.
+     *
+     * So the row survives as a tombstone with nothing personal left on it —
+     * see `accountDeletionService`, which is the only thing that writes this
+     * field and which purges the personal collections outright in the same
+     * pass. What remains is an id, a placeholder name, and the counters other
+     * people's history is expressed in terms of.
+     *
+     * ## What it must gate
+     *
+     * Everything that could put a deleted account back in front of somebody:
+     * sign-in, session resume, user search, the leaderboards and friend
+     * lookups. A filter missed here is an account that was deleted everywhere
+     * except the one screen nobody checked.
+     */
+    deletedAt: { type: Date, default: null, index: true },
 
     /**
      * Lifetime statistics.
@@ -123,6 +188,26 @@ const userSchema = new Schema(
     gamesWon: { type: Number, default: 0, min: 0 },
     totalScore: { type: Number, default: 0, min: 0 },
     bestRoundScore: { type: Number, default: 0, min: 0 },
+
+    /**
+     * Matches finished in a room that had at least one Stupid in it.
+     *
+     * A subset of `gamesPlayed`, not a parallel total, so "online games" is
+     * the subtraction and the two can never disagree. Counted per *room*
+     * rather than per bot: one Stupid or five, the match was played against
+     * the house, and the profile line is about which kind of evening it was.
+     */
+    botGamesPlayed: { type: Number, default: 0, min: 0 },
+
+    /**
+     * Matches finished, keyed by game id — `SCRIBBLE_GUESS`, `LUDO`, and so on.
+     *
+     * A map rather than a column per game, because the catalogue grows and a
+     * schema migration per new mini-game would be absurd. Read only to answer
+     * "which of these do you actually play", which is the one thing a
+     * multi-game profile can say that a single-game one could not.
+     */
+    gamesByGameId: { type: Map, of: Number, default: () => new Map<string, number>() },
 
     /**
      * The counters the achievement catalogue watches.

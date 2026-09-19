@@ -23,6 +23,7 @@ import type {
   UserStatsDto,
   UserSummaryDto,
 } from '@/types/social.types';
+import { foldAvatarId } from '@/utils/avatar';
 import { errors } from '@/utils/errors';
 
 /**
@@ -58,6 +59,56 @@ export interface PublicUser {
    * that already reads this shape has to change.
    */
   locality: LocalityDto | null;
+
+  /**
+   * The notification and privacy switches, as this account has them set.
+   *
+   * Sent with the profile rather than from an endpoint of its own so the
+   * Settings screen can draw six toggles from the read it already makes, and
+   * so they are never briefly drawn at their defaults before the real values
+   * arrive. Absent for another player — see `publicProfile`, which builds a
+   * different shape: what somebody has asked not to be sent is their business.
+   */
+  preferences: UserPreferences;
+}
+
+/** The six switches an account owns. */
+export interface UserPreferences {
+  notifyGameInvites: boolean;
+  notifyFriendActivity: boolean;
+  notifyRoomActivity: boolean;
+  notifySystem: boolean;
+  showOnlineStatus: boolean;
+  discoverable: boolean;
+}
+
+/**
+ * The permissive default, applied to any switch a row does not carry.
+ *
+ * Every account created before preferences existed has no subdocument at all,
+ * and must keep behaving exactly as it did — which means opted in. Reading
+ * through this rather than trusting the stored object is what makes that true
+ * without a migration.
+ */
+export const DEFAULT_PREFERENCES: UserPreferences = {
+  notifyGameInvites: true,
+  notifyFriendActivity: true,
+  notifyRoomActivity: true,
+  notifySystem: true,
+  showOnlineStatus: true,
+  discoverable: true,
+};
+
+/** Fills in whatever a stored preferences object is missing. */
+export function withPreferenceDefaults(stored: unknown): UserPreferences {
+  const raw = (stored ?? {}) as Partial<Record<keyof UserPreferences, unknown>>;
+  const resolved = { ...DEFAULT_PREFERENCES };
+
+  for (const key of Object.keys(DEFAULT_PREFERENCES) as (keyof UserPreferences)[]) {
+    if (typeof raw[key] === 'boolean') resolved[key] = raw[key];
+  }
+
+  return resolved;
 }
 
 export class UserService {
@@ -78,7 +129,35 @@ export class UserService {
       createdAt: new Date(user.createdAt ?? Date.now()).toISOString(),
       lastSeenAt: new Date(user.lastSeenAt ?? Date.now()).toISOString(),
       locality: toLocality(user as RankableUser),
+      preferences: withPreferenceDefaults(user.preferences),
     };
+  }
+
+  /**
+   * Writes the switches the player just flipped, and returns the whole profile.
+   *
+   * Dot-path `$set` rather than replacing the subdocument, so a patch naming
+   * one switch leaves the other five exactly as they were — which is what lets
+   * two devices toggle different things without one losing.
+   */
+  async updatePreferences(
+    userId: string,
+    patch: Partial<UserPreferences>,
+  ): Promise<PublicUser> {
+    const update: Record<string, boolean> = {};
+    for (const key of Object.keys(DEFAULT_PREFERENCES) as (keyof UserPreferences)[]) {
+      const value = patch[key];
+      if (typeof value === 'boolean') update[`preferences.${key}`] = value;
+    }
+
+    // An empty patch is a no-op rather than an error: a client that sent
+    // nothing changed nothing, and the profile it gets back is still correct.
+    if (Object.keys(update).length > 0) {
+      const changed = await userRepository.updatePreferences(userId, update);
+      if (!changed) throw errors.auth('That account no longer exists.');
+    }
+
+    return this.me(userId);
   }
 
   /**
@@ -112,7 +191,7 @@ export class UserService {
     if (patch.username !== undefined) update.username = sanitizeUsername(patch.username);
 
     if (patch.avatarId !== undefined) {
-      update.avatarId = clamp(patch.avatarId, INPUT_LIMITS.avatarCount);
+      update.avatarId = foldAvatarId(patch.avatarId);
     }
     if (patch.avatarColorIndex !== undefined) {
       update.avatarColorIndex = clamp(patch.avatarColorIndex, INPUT_LIMITS.avatarColorCount);

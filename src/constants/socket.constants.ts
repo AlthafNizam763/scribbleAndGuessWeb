@@ -56,6 +56,19 @@ export const CLIENT_ROOM_VOTE_KICK = 'c:room:voteKick';
 /** Reports a player with a free-form reason. */
 export const CLIENT_ROOM_REPORT = 'c:room:report';
 
+// --- PLAY WITH STUPID -------------------------------------------------------
+
+/**
+ * Seats bot players — Stupids — in the room. Host only, lobby only.
+ *
+ * Named for the product feature rather than for the implementation, the same
+ * way every other event here is: the payload says how many, the server decides
+ * which, and the seats come back in the ordinary `s:room:state` that follows.
+ */
+export const CLIENT_ROOM_ADD_STUPIDS = 'c:room:addStupids';
+/** Removes every Stupid from the room. Host only, lobby only. */
+export const CLIENT_ROOM_CLEAR_STUPIDS = 'c:room:clearStupids';
+
 // --- invitations ------------------------------------------------------------
 
 /**
@@ -323,6 +336,8 @@ export const ALIASES: Readonly<Record<string, string>> = Object.freeze({
   'room:invite_accept': CLIENT_ROOM_INVITE_ACCEPT,
   'room:invite_reject': CLIENT_ROOM_INVITE_REJECT,
   'player:ready': CLIENT_ROOM_READY,
+  'room:add_stupids': CLIENT_ROOM_ADD_STUPIDS,
+  'room:clear_stupids': CLIENT_ROOM_CLEAR_STUPIDS,
   'game:start': CLIENT_GAME_START,
   'game:select_word': CLIENT_GAME_SELECT_WORD,
   'game:play_again': CLIENT_GAME_PLAY_AGAIN,

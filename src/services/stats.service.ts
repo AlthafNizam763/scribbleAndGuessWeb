@@ -44,6 +44,7 @@ export class StatsService {
     if (!user) throw errors.notFound('That player no longer exists.');
 
     const played = Math.max(0, user.gamesPlayed ?? 0);
+    const bots = Math.min(played, Math.max(0, user.botGamesPlayed ?? 0));
     const won = Math.max(0, user.gamesWon ?? 0);
     const drawn = Math.max(0, user.drawingTurns ?? 0);
     const perfect = Math.max(0, user.perfectDrawings ?? 0);
@@ -57,6 +58,12 @@ export class StatsService {
       // never negative, even if a counter were somehow written out of step.
       gamesLost: Math.max(0, played - won),
       winRate: rate(won, played),
+
+      // Clamped to `played` rather than trusted, so a counter written out of
+      // step can never make "online games" negative on somebody's profile.
+      botGamesPlayed: bots,
+      onlineGamesPlayed: Math.max(0, played - bots),
+      gamesByGameId: rankGames(user.gamesByGameId),
 
       totalScore: Math.max(0, user.totalScore ?? 0),
       bestRoundScore: Math.max(0, user.bestRoundScore ?? 0),
@@ -86,3 +93,26 @@ export class StatsService {
 }
 
 export const statsService = new StatsService();
+
+/**
+ * The per-game tally, as an ordered array of the games actually played.
+ *
+ * Zeroes are dropped rather than sent: a profile listing five games at zero
+ * says nothing about the player, and the whole point of this line is to say
+ * what they reach for. Sorted here rather than on the client so every client
+ * shows the same order, and tie-broken on the id so the order is stable
+ * between two reads that saw the same numbers.
+ */
+function rankGames(stored: unknown): { gameId: string; played: number }[] {
+  if (!stored) return [];
+
+  // A lean read gives a plain object; a hydrated document gives a Map. Both
+  // reach this function depending on the caller, so both are handled.
+  const entries: [string, unknown][] =
+    stored instanceof Map ? [...stored.entries()] : Object.entries(stored as object);
+
+  return entries
+    .map(([gameId, value]) => ({ gameId, played: Math.max(0, Number(value) || 0) }))
+    .filter((row) => row.played > 0)
+    .sort((a, b) => b.played - a.played || a.gameId.localeCompare(b.gameId));
+}

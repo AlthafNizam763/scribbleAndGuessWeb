@@ -1,6 +1,8 @@
 import { emitToRoom, removeUserFromRoomChannel } from '@/config/socket';
 import {
+  CLIENT_ROOM_ADD_STUPIDS,
   CLIENT_ROOM_BAN,
+  CLIENT_ROOM_CLEAR_STUPIDS,
   CLIENT_ROOM_CREATE,
   CLIENT_ROOM_INVITE,
   CLIENT_ROOM_INVITE_ACCEPT,
@@ -28,6 +30,7 @@ import {
 } from '@/constants/socket.constants';
 import { parsePayload } from '@/middleware/validation.middleware';
 import {
+  addStupidsSchema,
   invitationTargetSchema,
   inviteToRoomSchema,
   joinRoomSchema,
@@ -45,6 +48,7 @@ import { invitationService } from '@/services/invitation.service';
 import { matchmakingService } from '@/services/matchmaking.service';
 import { moderationService } from '@/services/moderation.service';
 import { spectatorService } from '@/services/spectator.service';
+import { stupidsService } from '@/services/stupids.service';
 import { presenceService } from '@/services/presence.service';
 import { roomService, defaultSettings } from '@/services/room.service';
 import { voiceService } from '@/services/voice.service';
@@ -341,6 +345,39 @@ export function registerRoomHandlers(socket: GameSocket): void {
       return { rejected: true };
     },
     { limit: 'action', errorEvent: ROOM_EVENTS.error.alias },
+  );
+
+  // --------------------------------------------------------- PLAY WITH STUPID
+
+  /**
+   * Seats Stupids. Host only, lobby only, both enforced in the service.
+   *
+   * No push of its own: the seats appear in the `s:room:state` broadcast that
+   * follows, which is the same way a person arriving appears. A dedicated
+   * `s:room:stupidsAdded` would be a second description of the roster for
+   * clients to disagree about.
+   */
+  on(
+    socket,
+    CLIENT_ROOM_ADD_STUPIDS,
+    async ({ room, userId }, payload) => {
+      const { count } = parsePayload(payload, addStupidsSchema);
+      const seated = await stupidsService.seat({ room, actorId: userId, count });
+      await gameService.broadcastState(room);
+      return { seated: seated.length };
+    },
+    { limit: 'moderation', requiresRoom: true },
+  );
+
+  on(
+    socket,
+    CLIENT_ROOM_CLEAR_STUPIDS,
+    async ({ room, userId }) => {
+      const removed = await stupidsService.clear(room, userId);
+      await gameService.broadcastState(room);
+      return { removed };
+    },
+    { limit: 'moderation', requiresRoom: true },
   );
 
   // -------------------------------------------------------------- moderation

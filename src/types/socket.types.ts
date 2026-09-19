@@ -21,6 +21,24 @@ export interface SocketData {
   user: AuthenticatedUser;
   /** The room this socket is seated in, or null in the lobby-less state. */
   roomId: string | null;
+  /** A platform-game room. Kept apart from the legacy Scribble room seat. */
+  platformRoomId?: string | null;
+  /**
+   * The real-time match this socket has been checked into.
+   *
+   * Only Space Mystery sets it. It is a cache of one database read — "is this
+   * user actually in this match" — held per socket rather than per user so it
+   * cannot outlive the connection that earned it.
+   */
+  platformMatchId?: string | null;
+  /**
+   * The platform room whose voice group this socket is in, or null.
+   *
+   * Kept apart from [platformRoomId] because they are genuinely different
+   * memberships: a player can sit at a table without joining voice, and a
+   * disconnect has to tear down the second without assuming the first.
+   */
+  platformVoiceRoomId?: string | null;
   /** Rate-limiter buckets, keyed by action. */
   buckets: Map<string, { tokens: number; updatedAt: number }>;
 }

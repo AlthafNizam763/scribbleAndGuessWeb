@@ -7,9 +7,9 @@ import {
   enforceHttpLimit,
 } from '@/middleware/rateLimit.middleware';
 import { parseBody } from '@/middleware/validation.middleware';
-import { requireUser } from '@/middleware/auth.middleware';
+import { optionalUser, requireUser } from '@/middleware/auth.middleware';
 import { authService } from '@/services/auth.service';
-import { guestLoginSchema } from '@/validators/auth.validator';
+import { guestLoginSchema, loginSchema, registerSchema } from '@/validators/auth.validator';
 
 /**
  * Auth endpoints (brief section 7).
@@ -38,10 +38,78 @@ export const authController = {
           username: user.username,
           avatarId: user.avatarId,
           avatarColorIndex: user.avatarColorIndex,
+          provider: user.provider,
         },
       },
       201,
     );
+  },
+
+  /**
+   * `POST /api/auth/register`
+   *
+   * Authentication is *optional* here, and that is the whole design. Called
+   * with no token it creates an account. Called with a guest's token it turns
+   * that guest into an email account in place, so a player who has been
+   * playing all evening keeps their scores, friends and achievements instead
+   * of starting again behind a second row.
+   *
+   * `optionalUser` rather than `requireUser` because a bad or expired token
+   * must not block a signed-out registration — it is simply treated as absent.
+   */
+  async register(request: Request): Promise<NextResponse> {
+    enforceHttpLimit('register', clientIdentity(request));
+
+    await connectToDatabase();
+
+    const caller = await optionalUser(request);
+    const body = await parseBody(request, registerSchema);
+    const { token, user, upgraded } = await authService.register({
+      existingUserId: caller?.id ?? null,
+      existingProvider: caller?.provider ?? null,
+      ...body,
+    });
+
+    return ok(
+      {
+        token,
+        upgraded,
+        user: {
+          id: user.id,
+          username: user.username,
+          avatarId: user.avatarId,
+          avatarColorIndex: user.avatarColorIndex,
+          provider: user.provider,
+        },
+      },
+      201,
+    );
+  },
+
+  /**
+   * `POST /api/auth/login`
+   *
+   * Rate limited by address before the body is even parsed, because the cost
+   * this endpoint has to control is the *attempt*, not the work behind it.
+   */
+  async login(request: Request): Promise<NextResponse> {
+    enforceHttpLimit('emailLogin', clientIdentity(request));
+
+    await connectToDatabase();
+
+    const body = await parseBody(request, loginSchema);
+    const { token, user } = await authService.login(body.email, body.password);
+
+    return ok({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        avatarId: user.avatarId,
+        avatarColorIndex: user.avatarColorIndex,
+        provider: user.provider,
+      },
+    });
   },
 
   /**

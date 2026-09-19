@@ -38,6 +38,10 @@ export const ErrorCode = {
    * be able to tell it apart from "you are not allowed to draw".
    */
   DRAWER_VOICE_DISABLED: 'DRAWER_VOICE_DISABLED',
+  /** The caller is not seated in the match they are trying to act on. */
+  NOT_IN_GAME: 'NOT_IN_GAME',
+  /** Voice exists for this game but is closed to this caller right now. */
+  VOICE_NOT_AVAILABLE: 'VOICE_NOT_AVAILABLE',
 } as const;
 
 export type ErrorCodeName = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -107,6 +111,25 @@ const SPECS: Record<ErrorCodeName, CodeSpec> = {
     status: 403,
     wire: 'drawerVoiceDisabled',
     message: 'Voice chat is off while you are drawing.',
+  },
+  NOT_IN_GAME: {
+    status: 403,
+    wire: 'invalidAction',
+    message: 'You are not in that game.',
+  },
+  /**
+   * Distinct from [NOT_IN_GAME] on purpose.
+   *
+   * "You are not in this game" is a membership answer and never changes while
+   * you are sitting there. "Voice is not available" is a *timing* answer — a
+   * ghost on the Meridian, a player out of the round at the bar — and the
+   * client shows it differently: the first is an error, the second is a
+   * microphone button that is simply off for now.
+   */
+  VOICE_NOT_AVAILABLE: {
+    status: 403,
+    wire: 'invalidAction',
+    message: 'Voice chat is not open to you right now.',
   },
 };
 
@@ -198,4 +221,7 @@ export const errors = {
   invalidAction: (message?: string) => new AppError(ErrorCode.INVALID_ACTION, message),
   drawerVoiceDisabled: (message?: string) =>
     new AppError(ErrorCode.DRAWER_VOICE_DISABLED, message),
+  notInGame: (message?: string) => new AppError(ErrorCode.NOT_IN_GAME, message),
+  voiceUnavailable: (message?: string) =>
+    new AppError(ErrorCode.VOICE_NOT_AVAILABLE, message),
 };

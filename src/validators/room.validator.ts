@@ -196,6 +196,21 @@ export const muteSchema = playerTargetSchema.extend({
   muted: z.boolean().default(true),
 });
 
+/**
+ * `c:room:addStupids`.
+ *
+ * Only a count. Which Stupids get seated, and at what difficulty, is the
+ * server's to decide — a client that could name a bot could name the same one
+ * twice, or name one an operator has switched off.
+ *
+ * The upper bound is the largest room the platform allows; the room's own
+ * `maxPlayers` narrows it further, and the service clamps to the seats
+ * actually free rather than refusing an over-ask.
+ */
+export const addStupidsSchema = z.object({
+  count: z.coerce.number().int().min(1).max(ROOM_LIMITS.maxPlayers.max).default(1),
+});
+
 /** `moderation:report`. */
 export const reportSchema = playerTargetSchema.extend({
   reason: z

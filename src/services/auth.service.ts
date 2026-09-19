@@ -6,6 +6,7 @@ import { INPUT_LIMITS } from '@/constants/game.constants';
 import { User } from '@/models/User';
 import { userRepository } from '@/repositories/user.repository';
 import type { AuthProvider, AuthenticatedUser, JwtPayload } from '@/types/auth.types';
+import { foldAvatarId } from '@/utils/avatar';
 import { errors } from '@/utils/errors';
 import { logger } from '@/utils/logger';
 
@@ -23,8 +24,9 @@ import { logger } from '@/utils/logger';
  * That is what makes section 6's "add Google/Apple/email later without a
  * rewrite" true: linking a provider sets `email` and `passwordHash` on the row
  * that already exists, and every game record the player accumulated as a guest
- * follows them. The `register` and `login` methods below are that path,
- * already wired, though no route exposes them yet.
+ * follows them. `register` and `login` below are that path, now exposed at
+ * `POST /api/auth/register` and `POST /api/auth/login`. A guest who registers
+ * while signed in is upgraded in place rather than duplicated.
  *
  * ## Why the token carries so little
  *
@@ -82,6 +84,18 @@ export class AuthService {
 
     if (!user) throw errors.auth('That account no longer exists.');
 
+    // A deleted account keeps its row as a tombstone so other people's match
+    // history still renders — see `accountDeletion.service.ts` — so "the row
+    // exists" is no longer the same question as "this account may sign in".
+    //
+    // Checked here rather than at each entry point because this method *is*
+    // the entry point: the REST middleware and the socket handshake both
+    // resolve identity through it, so one refusal covers every authenticated
+    // path, including the ones added after this line was written. The message
+    // matches the missing-account one above, so a token that outlived its
+    // account is not a way to learn whether that account was deleted.
+    if (user.deletedAt) throw errors.auth('That account no longer exists.');
+
     return {
       id: String(user._id),
       username: user.username,
@@ -101,7 +115,7 @@ export class AuthService {
 
     const created = await userRepository.create({
       username,
-      avatarId: clampIndex(input.avatarId, INPUT_LIMITS.avatarCount),
+      avatarId: foldAvatarId(input.avatarId),
       avatarColorIndex: clampIndex(input.avatarColorIndex, INPUT_LIMITS.avatarColorCount),
       provider: 'guest',
     });
@@ -145,6 +159,79 @@ export class AuthService {
     ).exec();
   }
 
+  /**
+   * Creates an email account, or upgrades the caller's guest account into one.
+   *
+   * The two cases are one method because they must not be allowed to diverge.
+   * If `existingUserId` names a guest the caller is already signed in as, the
+   * credentials are attached to *that* row and every game, score, friendship
+   * and achievement they accumulated as a guest follows them. With no such
+   * caller a fresh row is created first and then upgraded through the same
+   * path, so a new registration and an upgrade end on identical state.
+   *
+   * A caller who already has an email account is refused rather than
+   * re-credentialed: that request is either a mistake or an attempt to move
+   * somebody else's address onto the account in hand.
+   */
+  async register(input: {
+    existingUserId?: string | null;
+    existingProvider?: AuthProvider | null;
+    username?: string;
+    avatarId?: number;
+    avatarColorIndex?: number;
+    email: string;
+    password: string;
+  }): Promise<{ token: string; user: AuthenticatedUser; upgraded: boolean }> {
+    const email = input.email.trim().toLowerCase();
+
+    const taken = await userRepository.findByEmail(email);
+    if (taken && String(taken._id) !== input.existingUserId) {
+      throw errors.validation('That email is already registered.');
+    }
+
+    const upgrading = Boolean(input.existingUserId) && input.existingProvider === 'guest';
+
+    let userId: string;
+    if (upgrading) {
+      userId = String(input.existingUserId);
+    } else {
+      if (input.existingUserId) {
+        throw errors.validation('This account already has a sign-in. Sign out first.');
+      }
+      if (!input.username) {
+        throw errors.validation('Choose a display name.');
+      }
+      const created = await userRepository.create({
+        username: sanitizeUsername(input.username),
+        avatarId: foldAvatarId(input.avatarId ?? 0),
+        avatarColorIndex: clampIndex(input.avatarColorIndex ?? 0, INPUT_LIMITS.avatarColorCount),
+        provider: 'guest',
+      });
+      userId = String(created._id);
+    }
+
+    await this.attachEmailCredentials({ userId, email, password: input.password });
+
+    // Re-read rather than trusting the values above: an upgrade keeps whatever
+    // name and avatar the guest row already had, which this method never saw.
+    const user = await userRepository.findById(userId);
+    if (!user) throw errors.internal('Could not create that account.');
+
+    logger.info(upgrading ? 'guest upgraded to email' : 'email account created', { userId });
+
+    return {
+      token: this.issueToken(userId, 'email'),
+      user: {
+        id: userId,
+        username: user.username,
+        avatarId: user.avatarId,
+        avatarColorIndex: user.avatarColorIndex,
+        provider: 'email',
+      },
+      upgraded: upgrading,
+    };
+  }
+
   /** Verifies an email/password pair. */
   async login(email: string, password: string): Promise<{ token: string; user: AuthenticatedUser }> {
     const user = await User.findOne({ email: email.trim().toLowerCase() })
@@ -153,9 +240,12 @@ export class AuthService {
       .exec();
 
     // The same error whether the account is missing or the password is wrong,
-    // so this endpoint cannot be used to enumerate registered addresses.
+    // so this endpoint cannot be used to enumerate registered addresses. A
+    // deleted account takes the same path for the same reason — and in any
+    // case deletion unsets both `email` and `passwordHash`, so the lookup
+    // above will not have found it.
     const genericFailure = errors.auth('That email or password is not right.');
-    if (!user?.passwordHash) throw genericFailure;
+    if (!user?.passwordHash || user.deletedAt) throw genericFailure;
 
     const matches = await bcrypt.compare(password, user.passwordHash);
     if (!matches) throw genericFailure;

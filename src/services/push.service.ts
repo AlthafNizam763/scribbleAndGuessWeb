@@ -1,9 +1,11 @@
 import type { Message, MulticastMessage } from 'firebase-admin/messaging';
 
 import { getPushMessaging, isFirebaseConfigured, maskToken } from '@/config/firebaseAdmin';
-import { PUSH_ANDROID_CHANNEL } from '@/constants/notification.constants';
+import { NOTIFICATION_TYPE, PUSH_ANDROID_CHANNEL } from '@/constants/notification.constants';
 import type { UserDeviceTokenDocument } from '@/models/UserDeviceToken';
 import { deviceTokenRepository } from '@/repositories/deviceToken.repository';
+import { userRepository } from '@/repositories/user.repository';
+import { withPreferenceDefaults, type UserPreferences } from '@/services/user.service';
 import { logger } from '@/utils/logger';
 
 /**
@@ -134,6 +136,32 @@ function deliveryOptions(payload: PushPayload): Pick<Message, 'android' | 'apns'
   };
 }
 
+/**
+ * Which switch governs which notification type.
+ *
+ * Deliberately partial. A type with no entry here is always sent, because the
+ * failure mode of the alternative — a new notification silently going nowhere
+ * until somebody remembers to add a line — is much harder to spot than one
+ * that arrives when it should not.
+ *
+ * `game_result` and `achievement_unlocked` are absent on purpose: they are the
+ * outcome of something the player just did, not an interruption from somebody
+ * else, and there is no switch that claims to govern them.
+ */
+const PREFERENCE_FOR_TYPE: Readonly<Record<string, keyof UserPreferences>> = Object.freeze({
+  [NOTIFICATION_TYPE.roomInvitation]: 'notifyGameInvites',
+
+  [NOTIFICATION_TYPE.friendRequest]: 'notifyFriendActivity',
+  [NOTIFICATION_TYPE.friendRequestAccepted]: 'notifyFriendActivity',
+  [NOTIFICATION_TYPE.friendStartedPlaying]: 'notifyFriendActivity',
+  [NOTIFICATION_TYPE.friendJoinedRoom]: 'notifyFriendActivity',
+
+  [NOTIFICATION_TYPE.userJoinedRoom]: 'notifyRoomActivity',
+
+  [NOTIFICATION_TYPE.systemAnnouncement]: 'notifySystem',
+  [NOTIFICATION_TYPE.tournamentAnnouncement]: 'notifySystem',
+});
+
 export class PushService {
   /** Whether a service account is configured. */
   get isConfigured(): boolean {
@@ -184,6 +212,56 @@ export class PushService {
   }
 
   /**
+   * Drops the recipients who asked not to be sent this kind of notification.
+   *
+   * ## Why a switch on the type and not a flag on the payload
+   *
+   * Because the mapping is a product decision about *categories*, and there
+   * are more notification types than there are switches. A caller that passed
+   * its own preference key could pass the wrong one, or a new type could ship
+   * with none at all — and an unmapped type would then be either unsendable or
+   * unmutable depending on which way the default fell.
+   *
+   * An unmapped type is deliberately **always sent**. The alternative is a new
+   * notification silently going nowhere because nobody added a line here,
+   * which is far harder to notice than one that arrives.
+   *
+   * Fails open. If the preference read throws, everybody gets the push: a
+   * database hiccup should not swallow a room invitation.
+   */
+  private async honourPreferences(
+    userIds: string[],
+    payload: PushPayload,
+  ): Promise<string[]> {
+    const required = PREFERENCE_FOR_TYPE[payload.data.type ?? ''];
+    if (!required) return userIds;
+
+    try {
+      const rows = await userRepository.findPreferences(userIds);
+      const optedOut = new Set(
+        rows
+          .filter((row) => withPreferenceDefaults(row.preferences)[required] === false)
+          .map((row) => String(row._id)),
+      );
+
+      if (optedOut.size === 0) return userIds;
+
+      logger.info('[FCM] recipients opted out', {
+        type: payload.data.type,
+        preference: required,
+        dropped: optedOut.size,
+      });
+
+      return userIds.filter((id) => !optedOut.has(id));
+    } catch (error: unknown) {
+      logger.exception('[FCM] reading notification preferences failed', error, {
+        type: payload.data.type,
+      });
+      return userIds;
+    }
+  }
+
+  /**
    * Sends to every live device of every person named.
    *
    * One query for the tokens and one multicast per batch, rather than a send
@@ -192,8 +270,23 @@ export class PushService {
    * pruning below happens once with the whole list rather than row by row.
    */
   async sendToUsers(userIds: string[], payload: PushPayload): Promise<PushResult> {
-    const recipients = [...new Set(userIds)].filter(Boolean);
-    if (recipients.length === 0) return { ...EMPTY };
+    const deduped = [...new Set(userIds)].filter(Boolean);
+    if (deduped.length === 0) return { ...EMPTY };
+
+    // The one place a notification preference is enforced.
+    //
+    // Here rather than at each of the dozen call sites that compose a push,
+    // because this is the funnel every one of them already goes through — a
+    // per-caller check would be a list somebody has to remember to add to, and
+    // the one that was forgotten would be a buzz somebody asked not to get.
+    //
+    // A push is composed and delivered while the app is closed, which is why
+    // this cannot live in the client: a filter there would run on a phone that
+    // has already rung.
+    const recipients = await this.honourPreferences(deduped, payload);
+    if (recipients.length === 0) {
+      return { ...EMPTY, noRecipients: true };
+    }
 
     const messaging = getPushMessaging();
     if (!messaging) {

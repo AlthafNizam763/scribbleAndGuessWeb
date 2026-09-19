@@ -6,6 +6,9 @@ import { GAME_PHASE } from '@/constants/room.constants';
 import { roomChannel, SERVER_TIME_SYNC } from '@/constants/socket.constants';
 import { metrics, registerGauges } from '@/monitoring/metrics';
 import { invitationService } from '@/services/invitation.service';
+import { spaceMysteryEngine } from '@/games/spaceMystery/engine';
+import { platformBotService } from '@/services/bot/platformBot.service';
+import { platformVoiceService } from '@/services/platformVoice.service';
 import { botPlayerService } from '@/services/bot/botPlayer.service';
 import { presenceService } from '@/services/presence.service';
 import { tournamentBot } from '@/services/tournament/bot.service';
@@ -13,6 +16,7 @@ import { roomService } from '@/services/room.service';
 import { registerChatExtrasHandlers, registerChatHandlers } from '@/socket/chat.socket';
 import { registerDrawingHandlers } from '@/socket/drawing.socket';
 import { registerGameHandlers } from '@/socket/game.socket';
+import { registerPlatformGameHandlers } from '@/socket/game_platform.socket';
 import { registerPresenceHandlers } from '@/socket/presence.socket';
 import { registerRoomHandlers, registerSpectatorHandlers } from '@/socket/room.socket';
 import { registerTournamentHandlers } from '@/socket/tournament.socket';
@@ -78,6 +82,7 @@ export function attachSocketServer(httpServer: HttpServer): GameServer {
     registerPresenceHandlers(gameSocket);
     registerRoomHandlers(gameSocket);
     registerGameHandlers(gameSocket);
+    registerPlatformGameHandlers(gameSocket);
     registerDrawingHandlers(gameSocket);
     registerChatHandlers(gameSocket);
     registerChatExtrasHandlers(gameSocket);
@@ -206,6 +211,17 @@ function registerRealtimeGauges(io: GameServer): void {
       // means bots are being skipped — and one that never falls to zero
       // between matches means a task is not being cleaned up.
       botWorkers: botPlayerService.activeWorkers(),
+      // The same question for the platform games: Stupids holding a pending
+      // turn on a card or board game.
+      platformBotWorkers: platformBotService.activeWorkers(),
+      // Space Mystery ships currently being simulated. This is the one number
+      // here that costs CPU rather than memory — each is a twenty-hertz tick —
+      // and one that never falls to zero between matches is a match that
+      // finished without anybody stopping its clock.
+      spaceMysteryMatches: spaceMysteryEngine.activeMatches(),
+      // Platform-game voice members. A number that never falls to zero between
+      // matches is a peer connection nobody hung up.
+      platformVoiceMembers: platformVoiceService.activeMembers(),
     };
   });
 }

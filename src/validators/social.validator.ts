@@ -147,3 +147,26 @@ export const resolveReportSchema = z.object({
   status: z.enum(['actioned', 'dismissed']).default('dismissed'),
   note: z.string().trim().max(280).optional(),
 });
+
+/**
+ * `PATCH /api/users/me/preferences`.
+ *
+ * Every key is optional, so a client sends the switch the player just flipped
+ * rather than the whole set. Two devices changing different switches therefore
+ * cannot overwrite one another, which a whole-object PUT would allow.
+ *
+ * Booleans only, and a closed set of them. There is no field here that names a
+ * user, a score or a token, so no shape of this request reaches anything but
+ * these six flags.
+ */
+export const userPreferencesSchema = z.object({
+  notifyGameInvites: z.boolean().optional(),
+  notifyFriendActivity: z.boolean().optional(),
+  notifyRoomActivity: z.boolean().optional(),
+  notifySystem: z.boolean().optional(),
+  showOnlineStatus: z.boolean().optional(),
+  discoverable: z.boolean().optional(),
+});
+
+/** The parsed shape, for services that take it. */
+export type UserPreferencesPatch = z.infer<typeof userPreferencesSchema>;

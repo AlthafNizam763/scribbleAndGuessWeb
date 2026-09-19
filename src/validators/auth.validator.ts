@@ -45,6 +45,68 @@ export const guestLoginSchema = z.object({
 });
 
 /**
+ * An address, normalised to the form the unique index is built on.
+ *
+ * Lowercased here rather than at the point of use, so that the value the
+ * schema hands downstream is already the value stored — otherwise a
+ * registration for `Player@Example.com` and a sign-in for `player@example.com`
+ * would disagree about whether they are the same account.
+ */
+const emailSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .min(3, 'Enter your email address.')
+  .max(254, 'That email address is too long.')
+  .email('That does not look like an email address.');
+
+/**
+ * A password, bounded at both ends.
+ *
+ * The floor is eight characters. The ceiling is 72 *bytes*, and it is a
+ * correctness bound rather than a policy one: bcrypt hashes only the first 72
+ * bytes of its input and silently discards the rest, so a longer password
+ * would authenticate against its own truncation — two different passwords
+ * sharing a 72-byte prefix would open the same account. Measured in bytes,
+ * not characters, because the limit is bcrypt's and a multi-byte character
+ * spends more than one of them.
+ */
+const passwordSchema = z
+  .string()
+  .min(8, 'Use at least 8 characters.')
+  .refine((value) => new TextEncoder().encode(value).length <= 72, {
+    message: 'That password is too long.',
+  });
+
+/**
+ * `POST /api/auth/register`.
+ *
+ * The username and avatar are optional because this endpoint serves two
+ * callers. A brand-new player sends all four fields. A guest upgrading an
+ * account they have already been playing on sends only the credentials, and
+ * keeps the name and face their existing row carries.
+ */
+export const registerSchema = z.object({
+  username: usernameSchema.optional(),
+  avatarId: avatarIdSchema.optional(),
+  avatarColorIndex: avatarColorSchema.optional(),
+  email: emailSchema,
+  password: passwordSchema,
+});
+
+/**
+ * `POST /api/auth/login`.
+ *
+ * The password is only bounded, never pattern-checked. Rejecting a stored
+ * password for failing today's rules would lock out an account that was valid
+ * when it was made; whether it matches is the hash's business.
+ */
+export const loginSchema = z.object({
+  email: emailSchema,
+  password: z.string().min(1, 'Enter your password.').max(512),
+});
+
+/**
  * `PATCH /api/users/me`.
  *
  * Only these three keys exist. A body carrying `score` or `gamesWon` does not
@@ -103,7 +165,11 @@ export const playerProfileSchema = z.object({
  */
 export const profileSyncSchema = z.object({
   name: usernameSchema.optional(),
-  avatarId: z.coerce.number().int().min(0).max(INPUT_LIMITS.avatarCount - 1).optional(),
+  // The *legacy* bound: an app built before the cats holds ids up to 17, and
+  // rejecting one here would fail the whole sync — including the username,
+  // which is the thing this schema exists to keep current. The service folds
+  // it onto a cat on write.
+  avatarId: z.coerce.number().int().min(0).max(INPUT_LIMITS.legacyAvatarCount - 1).optional(),
   avatarColorIndex: z.coerce
     .number()
     .int()

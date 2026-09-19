@@ -5,12 +5,14 @@ import { ok } from '@/middleware/error.middleware';
 import { requireUser } from '@/middleware/auth.middleware';
 import { clientIdentity, enforceHttpLimit } from '@/middleware/rateLimit.middleware';
 import { parseBody, parseQuery } from '@/middleware/validation.middleware';
+import { accountDeletionService } from '@/services/accountDeletion.service';
 import { userService } from '@/services/user.service';
 import { updateProfileSchema } from '@/validators/auth.validator';
 import {
   localitySchema,
   objectIdSchema,
   searchQuerySchema,
+  userPreferencesSchema,
 } from '@/validators/social.validator';
 
 /** Profile endpoints (brief section 8). */
@@ -33,6 +35,49 @@ export const userController = {
     const patch = await parseBody(request, updateProfileSchema);
 
     return ok({ user: await userService.updateProfile(user.id, patch) });
+  },
+
+  /**
+   * `PATCH /api/users/me/preferences`
+   *
+   * The notification and privacy switches, and only those. A separate endpoint
+   * from the profile patch for the same reason the locality one is: the set of
+   * fields an endpoint can write *is* the security boundary, so a request
+   * aimed at muting notifications cannot also rename somebody.
+   *
+   * Every key is optional — a client sends the one the player just toggled,
+   * not the whole set — so two devices changing different switches do not
+   * overwrite each other.
+   */
+  async updatePreferences(request: Request): Promise<NextResponse> {
+    const user = await requireUser(request);
+    await connectToDatabase();
+
+    const patch = await parseBody(request, userPreferencesSchema);
+
+    return ok({ user: await userService.updatePreferences(user.id, patch) });
+  },
+
+  /**
+   * `DELETE /api/users/me`
+   *
+   * Deletes the caller's own account. There is no parameter naming a user, so
+   * there is no shape of this request that deletes somebody else's — which is
+   * a stronger guarantee than checking an id would be.
+   *
+   * Rate limited like a destructive action rather than a read: the work is a
+   * dozen collection-wide deletes, and nothing legitimate calls it twice.
+   */
+  async deleteMe(request: Request): Promise<NextResponse> {
+    const user = await requireUser(request);
+    enforceHttpLimit('deleteAccount', clientIdentity(request, user.id));
+    await connectToDatabase();
+
+    const outcome = await accountDeletionService.delete(user.id);
+
+    // 200 rather than 204: the client shows a confirmation before it clears
+    // its session, and a body it can read is what tells it the server agreed.
+    return ok({ deleted: true, alreadyDeleted: outcome.alreadyDeleted });
   },
 
   /**
